@@ -55,6 +55,7 @@ from typing import overload
 
 import google.protobuf.wrappers_pb2
 import proto
+from google.protobuf import message
 
 from apache_beam.coders import coder_impl
 from apache_beam.coders.avro_record import AvroRecord
@@ -65,7 +66,6 @@ from apache_beam.typehints import typehints
 from apache_beam.utils import proto_utils
 
 if TYPE_CHECKING:
-  from google.protobuf import message  # pylint: disable=ungrouped-imports
   from apache_beam.coders.typecoders import CoderRegistry
   from apache_beam.runners.pipeline_context import PipelineContext
 
@@ -242,9 +242,10 @@ class Coder(object):
     return self.__dict__
 
   def to_type_hint(self):
-    raise NotImplementedError(
-        'https://github.com/apache/beam/issues/18490: %s' %
-        self.__class__.__name__)
+    # TODO: After https://github.com/apache/beam/issues/18490 we should be
+    # able to infer the type hint rather than require every subclass define
+    # it
+    raise NotImplementedError
 
   @classmethod
   def from_type_hint(cls, unused_typehint, unused_registry):
@@ -1038,11 +1039,18 @@ class ProtoCoder(FastCoder):
 
   @classmethod
   def from_type_hint(cls, typehint, unused_registry):
-    if issubclass(typehint, proto_utils.message_types):
+    # The typehint must be a strict subclass of google.protobuf.message.Message.
+    # ProtoCoder cannot work with message.Message itself, as deserialization of
+    # a serialized proto requires knowledge of the desired concrete proto
+    # subclass which is not stored in the encoded bytes themselves. If this
+    # occurs, an error is raised and the system defaults to other fallback
+    # coders.
+    if (issubclass(typehint, proto_utils.message_types) and
+        typehint != message.Message):
       return cls(typehint)
     else:
       raise ValueError((
-          'Expected a subclass of google.protobuf.message.Message'
+          'Expected a strict subclass of google.protobuf.message.Message'
           ', but got a %s' % typehint))
 
   def to_type_hint(self):
@@ -1349,12 +1357,48 @@ Coder.register_structured_urn(
     common_urns.coders.INTERVAL_WINDOW.urn, IntervalWindowCoder)
 
 
+class _OrderedUnionCoder(FastCoder):
+  def __init__(
+      self, *coder_types: Tuple[type, Coder], fallback_coder: Optional[Coder]):
+    self._coder_types = coder_types
+    self._fallback_coder = fallback_coder
+
+  def _create_impl(self):
+    return coder_impl._OrderedUnionCoderImpl(
+        [(t, c.get_impl()) for t, c in self._coder_types],
+        fallback_coder_impl=self._fallback_coder.get_impl()
+        if self._fallback_coder else None)
+
+  def is_deterministic(self) -> bool:
+    return (
+        all(c.is_deterministic for _, c in self._coder_types) and (
+            self._fallback_coder is None or
+            self._fallback_coder.is_deterministic()))
+
+  def to_type_hint(self):
+    return Any
+
+  def __eq__(self, other):
+    return (
+        type(self) == type(other) and
+        self._coder_types == other._coder_types and
+        self._fallback_coder == other._fallback_coder)
+
+  def __hash__(self):
+    return hash((type(self), tuple(self._coder_types), self._fallback_coder))
+
+
 class WindowedValueCoder(FastCoder):
   """Coder for windowed values."""
   def __init__(self, wrapped_value_coder, window_coder=None):
     # type: (Coder, Optional[Coder]) -> None
     if not window_coder:
-      window_coder = PickleCoder()
+      # Avoid circular imports.
+      from apache_beam.transforms import window
+      window_coder = _OrderedUnionCoder(
+          (window.GlobalWindow, GlobalWindowCoder()),
+          (window.IntervalWindow, IntervalWindowCoder()),
+          fallback_coder=PickleCoder())
     self.wrapped_value_coder = wrapped_value_coder
     self.timestamp_coder = TimestampCoder()
     self.window_coder = window_coder
@@ -1481,6 +1525,9 @@ class LengthPrefixCoder(FastCoder):
 
   def __hash__(self):
     return hash((type(self), self._value_coder))
+
+  def to_type_hint(length_prefix_coder):
+    return length_prefix_coder.value_coder().to_type_hint()
 
 
 Coder.register_structured_urn(
@@ -1626,6 +1673,34 @@ class TimestampPrefixingWindowCoder(FastCoder):
 
 Coder.register_structured_urn(
     common_urns.coders.CUSTOM_WINDOW.urn, TimestampPrefixingWindowCoder)
+
+
+class TimestampPrefixingOpaqueWindowCoder(FastCoder):
+  """For internal use only; no backwards-compatibility guarantees.
+
+  Coder which decodes windows as bytes."""
+  def __init__(self) -> None:
+    pass
+
+  def _create_impl(self):
+    return coder_impl.TimestampPrefixingOpaqueWindowCoderImpl()
+
+  def is_deterministic(self) -> bool:
+    return True
+
+  def __repr__(self):
+    return 'TimestampPrefixingOpaqueWindowCoder'
+
+  def __eq__(self, other):
+    return type(self) == type(other)
+
+  def __hash__(self):
+    return hash((type(self)))
+
+
+Coder.register_structured_urn(
+    python_urns.TIMESTAMP_PREFIXED_OPAQUE_WINDOW_CODER,
+    TimestampPrefixingOpaqueWindowCoder)
 
 
 class BigIntegerCoder(FastCoder):

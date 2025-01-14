@@ -17,19 +17,24 @@
  */
 package org.apache.beam.sdk.io.gcp.bigquery;
 
+import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.CONNECTION_ID;
+import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.STORAGE_URI;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.api.client.util.BackOff;
 import com.google.api.client.util.BackOffUtils;
 import com.google.api.gax.rpc.ApiException;
+import com.google.api.services.bigquery.model.BigLakeConfiguration;
 import com.google.api.services.bigquery.model.Clustering;
 import com.google.api.services.bigquery.model.EncryptionConfiguration;
 import com.google.api.services.bigquery.model.Table;
+import com.google.api.services.bigquery.model.TableConstraints;
 import com.google.api.services.bigquery.model.TableReference;
 import com.google.api.services.bigquery.model.TableSchema;
 import com.google.api.services.bigquery.model.TimePartitioning;
 import io.grpc.StatusRuntimeException;
 import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -40,6 +45,7 @@ import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.DatasetService;
 import org.apache.beam.sdk.util.FluentBackoff;
 import org.apache.beam.sdk.util.Preconditions;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Supplier;
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -86,10 +92,12 @@ public class CreateTableHelpers {
       BigQueryOptions bigQueryOptions,
       TableDestination tableDestination,
       Supplier<@Nullable TableSchema> schemaSupplier,
+      Supplier<@Nullable TableConstraints> tableConstraintsSupplier,
       CreateDisposition createDisposition,
       @Nullable Coder<?> tableDestinationCoder,
       @Nullable String kmsKey,
-      BigQueryServices bqServices) {
+      BigQueryServices bqServices,
+      @Nullable Map<String, String> bigLakeConfiguration) {
     checkArgument(
         tableDestination.getTableSpec() != null,
         "DynamicDestinations.getTable() must return a TableDestination "
@@ -125,11 +133,13 @@ public class CreateTableHelpers {
           tryCreateTable(
               bigQueryOptions,
               schemaSupplier,
+              tableConstraintsSupplier,
               tableDestination,
               createDisposition,
               tableSpec,
               kmsKey,
-              bqServices);
+              bqServices,
+              bigLakeConfiguration);
         }
       }
     }
@@ -139,11 +149,13 @@ public class CreateTableHelpers {
   private static void tryCreateTable(
       BigQueryOptions options,
       Supplier<@Nullable TableSchema> schemaSupplier,
+      Supplier<@Nullable TableConstraints> tableConstraintsSupplier,
       TableDestination tableDestination,
       CreateDisposition createDisposition,
       String tableSpec,
       @Nullable String kmsKey,
-      BigQueryServices bqServices) {
+      BigQueryServices bqServices,
+      @Nullable Map<String, String> bigLakeConfiguration) {
     TableReference tableReference = tableDestination.getTableReference().clone();
     tableReference.setTableId(BigQueryHelpers.stripPartitionDecorator(tableReference.getTableId()));
     try (DatasetService datasetService = bqServices.getDatasetService(options)) {
@@ -151,6 +163,7 @@ public class CreateTableHelpers {
               tableReference, Collections.emptyList(), DatasetService.TableMetadataView.BASIC)
           == null) {
         TableSchema tableSchema = schemaSupplier.get();
+        @Nullable TableConstraints tableConstraints = tableConstraintsSupplier.get();
         Preconditions.checkArgumentNotNull(
             tableSchema,
             "Unless create disposition is %s, a schema must be specified, i.e. "
@@ -162,6 +175,10 @@ public class CreateTableHelpers {
             tableDestination);
         Table table = new Table().setTableReference(tableReference).setSchema(tableSchema);
 
+        if (tableConstraints != null) {
+          table = table.setTableConstraints(tableConstraints);
+        }
+
         String tableDescription = tableDestination.getTableDescription();
         if (tableDescription != null) {
           table = table.setDescription(tableDescription);
@@ -170,13 +187,33 @@ public class CreateTableHelpers {
         TimePartitioning timePartitioning = tableDestination.getTimePartitioning();
         if (timePartitioning != null) {
           table.setTimePartitioning(timePartitioning);
-          Clustering clustering = tableDestination.getClustering();
-          if (clustering != null) {
-            table.setClustering(clustering);
-          }
         }
+
+        Clustering clustering = tableDestination.getClustering();
+        if (clustering != null) {
+          table.setClustering(clustering);
+        }
+
         if (kmsKey != null) {
           table.setEncryptionConfiguration(new EncryptionConfiguration().setKmsKeyName(kmsKey));
+        }
+        if (bigLakeConfiguration != null) {
+          TableReference ref = table.getTableReference();
+          table.setBiglakeConfiguration(
+              new BigLakeConfiguration()
+                  .setTableFormat(
+                      MoreObjects.firstNonNull(bigLakeConfiguration.get("tableFormat"), "iceberg"))
+                  .setFileFormat(
+                      MoreObjects.firstNonNull(bigLakeConfiguration.get("fileFormat"), "parquet"))
+                  .setConnectionId(
+                      Preconditions.checkArgumentNotNull(bigLakeConfiguration.get(CONNECTION_ID)))
+                  .setStorageUri(
+                      String.format(
+                          "%s/%s/%s/%s",
+                          Preconditions.checkArgumentNotNull(bigLakeConfiguration.get(STORAGE_URI)),
+                          ref.getProjectId(),
+                          ref.getDatasetId(),
+                          ref.getTableId())));
         }
         datasetService.createTable(table);
       }

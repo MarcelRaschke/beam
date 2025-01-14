@@ -53,9 +53,10 @@ import org.apache.beam.sdk.schemas.logicaltypes.VariableBytes;
 import org.apache.beam.sdk.schemas.logicaltypes.VariableString;
 import org.apache.beam.sdk.util.SerializableUtils;
 import org.apache.beam.sdk.values.Row;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.ByteString;
+import org.apache.beam.vendor.grpc.v1p60p1.com.google.protobuf.ByteString;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Maps;
@@ -74,7 +75,23 @@ public class SchemaTranslation {
   private static final Logger LOG = LoggerFactory.getLogger(SchemaTranslation.class);
 
   private static final String URN_BEAM_LOGICAL_DECIMAL = FixedPrecisionNumeric.BASE_IDENTIFIER;
-  private static final String URN_BEAM_LOGICAL_JAVASDK = "beam:logical_type:javasdk:v1";
+
+  private static String getLogicalTypeUrn(String identifier) {
+    if (identifier.startsWith("beam:logical_type:")) {
+      return identifier;
+    } else {
+      String filtered = identifier.replaceAll("[^0-9A-Za-z_]", "").toLowerCase();
+      if (!Strings.isNullOrEmpty(filtered)) {
+        // urn for non-standard Java SDK logical types are assigned with javasdk_<identifier>
+        return String.format("beam:logical_type:javasdk_%s:v1", filtered);
+      } else {
+        // raw "javasdk" name should only be a last resort. Types defined in Beam should have their
+        // own URN.
+        return "beam:logical_type:javasdk:v1";
+      }
+    }
+  }
+
   private static final String URN_BEAM_LOGICAL_MILLIS_INSTANT =
       SchemaApi.LogicalTypes.Enum.MILLIS_INSTANT
           .getValueDescriptor()
@@ -84,21 +101,26 @@ public class SchemaTranslation {
   // TODO(https://github.com/apache/beam/issues/19715): Populate this with a LogicalTypeRegistrar,
   // which includes a way to construct
   // the LogicalType given an argument.
-  private static final ImmutableMap<String, Class<? extends LogicalType<?, ?>>>
-      STANDARD_LOGICAL_TYPES =
-          ImmutableMap.<String, Class<? extends LogicalType<?, ?>>>builder()
-              .put(FixedPrecisionNumeric.IDENTIFIER, FixedPrecisionNumeric.class)
-              .put(MicrosInstant.IDENTIFIER, MicrosInstant.class)
-              .put(SchemaLogicalType.IDENTIFIER, SchemaLogicalType.class)
-              .put(PythonCallable.IDENTIFIER, PythonCallable.class)
-              .put(FixedBytes.IDENTIFIER, FixedBytes.class)
-              .put(VariableBytes.IDENTIFIER, VariableBytes.class)
-              .put(FixedString.IDENTIFIER, FixedString.class)
-              .put(VariableString.IDENTIFIER, VariableString.class)
-              .build();
+  @VisibleForTesting
+  static final ImmutableMap<String, Class<? extends LogicalType<?, ?>>> STANDARD_LOGICAL_TYPES =
+      ImmutableMap.<String, Class<? extends LogicalType<?, ?>>>builder()
+          .put(FixedPrecisionNumeric.IDENTIFIER, FixedPrecisionNumeric.class)
+          .put(MicrosInstant.IDENTIFIER, MicrosInstant.class)
+          .put(SchemaLogicalType.IDENTIFIER, SchemaLogicalType.class)
+          .put(PythonCallable.IDENTIFIER, PythonCallable.class)
+          .put(FixedBytes.IDENTIFIER, FixedBytes.class)
+          .put(VariableBytes.IDENTIFIER, VariableBytes.class)
+          .put(FixedString.IDENTIFIER, FixedString.class)
+          .put(VariableString.IDENTIFIER, VariableString.class)
+          .build();
 
   public static SchemaApi.Schema schemaToProto(Schema schema, boolean serializeLogicalType) {
-    String uuid = schema.getUUID() != null ? schema.getUUID().toString() : "";
+    return schemaToProto(schema, serializeLogicalType, true);
+  }
+
+  public static SchemaApi.Schema schemaToProto(
+      Schema schema, boolean serializeLogicalType, boolean serializeUUID) {
+    String uuid = schema.getUUID() != null && serializeUUID ? schema.getUUID().toString() : "";
     SchemaApi.Schema.Builder builder = SchemaApi.Schema.newBuilder().setId(uuid);
     for (Field field : schema.getFields()) {
       SchemaApi.Field protoField =
@@ -106,7 +128,8 @@ public class SchemaTranslation {
               field,
               schema.indexOf(field.getName()),
               schema.getEncodingPositions().get(field.getName()),
-              serializeLogicalType);
+              serializeLogicalType,
+              serializeUUID);
       builder.addFields(protoField);
     }
     builder.addAllOptions(optionsToProto(schema.getOptions()));
@@ -114,11 +137,11 @@ public class SchemaTranslation {
   }
 
   private static SchemaApi.Field fieldToProto(
-      Field field, int fieldId, int position, boolean serializeLogicalType) {
+      Field field, int fieldId, int position, boolean serializeLogicalType, boolean serializeUUID) {
     return SchemaApi.Field.newBuilder()
         .setName(field.getName())
         .setDescription(field.getDescription())
-        .setType(fieldTypeToProto(field.getType(), serializeLogicalType))
+        .setType(fieldTypeToProto(field.getType(), serializeLogicalType, serializeUUID))
         .setId(fieldId)
         .setEncodingPosition(position)
         .addAllOptions(optionsToProto(field.getOptions()))
@@ -126,34 +149,46 @@ public class SchemaTranslation {
   }
 
   @VisibleForTesting
-  static SchemaApi.FieldType fieldTypeToProto(FieldType fieldType, boolean serializeLogicalType) {
+  static SchemaApi.FieldType fieldTypeToProto(
+      FieldType fieldType, boolean serializeLogicalType, boolean serializeUUID) {
     SchemaApi.FieldType.Builder builder = SchemaApi.FieldType.newBuilder();
     switch (fieldType.getTypeName()) {
       case ROW:
         builder.setRowType(
             SchemaApi.RowType.newBuilder()
-                .setSchema(schemaToProto(fieldType.getRowSchema(), serializeLogicalType)));
+                .setSchema(
+                    schemaToProto(fieldType.getRowSchema(), serializeLogicalType, serializeUUID)));
         break;
 
       case ARRAY:
         builder.setArrayType(
             SchemaApi.ArrayType.newBuilder()
                 .setElementType(
-                    fieldTypeToProto(fieldType.getCollectionElementType(), serializeLogicalType)));
+                    fieldTypeToProto(
+                        fieldType.getCollectionElementType(),
+                        serializeLogicalType,
+                        serializeUUID)));
         break;
 
       case ITERABLE:
         builder.setIterableType(
             SchemaApi.IterableType.newBuilder()
                 .setElementType(
-                    fieldTypeToProto(fieldType.getCollectionElementType(), serializeLogicalType)));
+                    fieldTypeToProto(
+                        fieldType.getCollectionElementType(),
+                        serializeLogicalType,
+                        serializeUUID)));
         break;
 
       case MAP:
         builder.setMapType(
             SchemaApi.MapType.newBuilder()
-                .setKeyType(fieldTypeToProto(fieldType.getMapKeyType(), serializeLogicalType))
-                .setValueType(fieldTypeToProto(fieldType.getMapValueType(), serializeLogicalType))
+                .setKeyType(
+                    fieldTypeToProto(
+                        fieldType.getMapKeyType(), serializeLogicalType, serializeUUID))
+                .setValueType(
+                    fieldTypeToProto(
+                        fieldType.getMapValueType(), serializeLogicalType, serializeUUID))
                 .build());
         break;
 
@@ -169,31 +204,31 @@ public class SchemaTranslation {
                   .setUrn(logicalType.getIdentifier())
                   .setPayload(ByteString.copyFrom(((UnknownLogicalType) logicalType).getPayload()))
                   .setRepresentation(
-                      fieldTypeToProto(logicalType.getBaseType(), serializeLogicalType));
+                      fieldTypeToProto(
+                          logicalType.getBaseType(), serializeLogicalType, serializeUUID));
 
           if (logicalType.getArgumentType() != null) {
             logicalTypeBuilder
                 .setArgumentType(
-                    fieldTypeToProto(logicalType.getArgumentType(), serializeLogicalType))
+                    fieldTypeToProto(
+                        logicalType.getArgumentType(), serializeLogicalType, serializeUUID))
                 .setArgument(
                     fieldValueToProto(logicalType.getArgumentType(), logicalType.getArgument()));
           }
         } else {
-          // TODO(https://github.com/apache/beam/issues/19715): "javasdk" types should only
-          // be a last resort. Types defined in Beam should have their own URN, and there
-          // should be a mechanism for users to register their own types by URN.
-          String urn =
-              identifier.startsWith("beam:logical_type:") ? identifier : URN_BEAM_LOGICAL_JAVASDK;
+          String urn = getLogicalTypeUrn(identifier);
           logicalTypeBuilder =
               SchemaApi.LogicalType.newBuilder()
                   .setRepresentation(
-                      fieldTypeToProto(logicalType.getBaseType(), serializeLogicalType))
+                      fieldTypeToProto(
+                          logicalType.getBaseType(), serializeLogicalType, serializeUUID))
                   .setUrn(urn);
           if (logicalType.getArgumentType() != null) {
             logicalTypeBuilder =
                 logicalTypeBuilder
                     .setArgumentType(
-                        fieldTypeToProto(logicalType.getArgumentType(), serializeLogicalType))
+                        fieldTypeToProto(
+                            logicalType.getArgumentType(), serializeLogicalType, serializeUUID))
                     .setArgument(
                         fieldValueToProto(
                             logicalType.getArgumentType(), logicalType.getArgument()));
@@ -213,7 +248,8 @@ public class SchemaTranslation {
         builder.setLogicalType(
             SchemaApi.LogicalType.newBuilder()
                 .setUrn(URN_BEAM_LOGICAL_MILLIS_INSTANT)
-                .setRepresentation(fieldTypeToProto(FieldType.INT64, serializeLogicalType))
+                .setRepresentation(
+                    fieldTypeToProto(FieldType.INT64, serializeLogicalType, serializeUUID))
                 .build());
         break;
       case DECIMAL:
@@ -222,7 +258,8 @@ public class SchemaTranslation {
         builder.setLogicalType(
             SchemaApi.LogicalType.newBuilder()
                 .setUrn(URN_BEAM_LOGICAL_DECIMAL)
-                .setRepresentation(fieldTypeToProto(FieldType.BYTES, serializeLogicalType))
+                .setRepresentation(
+                    fieldTypeToProto(FieldType.BYTES, serializeLogicalType, serializeUUID))
                 .build());
         break;
       case BYTE:
@@ -275,14 +312,14 @@ public class SchemaTranslation {
     Schema schema = builder.build();
 
     Preconditions.checkState(encodingLocationMap.size() == schema.getFieldCount());
-    long dinstictEncodingPositions = encodingLocationMap.values().stream().distinct().count();
-    Preconditions.checkState(dinstictEncodingPositions <= schema.getFieldCount());
-    if (dinstictEncodingPositions < schema.getFieldCount() && schema.getFieldCount() > 0) {
+    long distinctEncodingPositions = encodingLocationMap.values().stream().distinct().count();
+    Preconditions.checkState(distinctEncodingPositions <= schema.getFieldCount());
+    if (distinctEncodingPositions < schema.getFieldCount() && schema.getFieldCount() > 0) {
       // This means that encoding positions were not specified in the proto. Generally, we don't
       // expect this to happen,
       // but if it does happen, we expect none to be specified - in which case the should all be
       // zero.
-      Preconditions.checkState(dinstictEncodingPositions == 1);
+      Preconditions.checkState(distinctEncodingPositions == 1);
     } else if (protoSchema.getEncodingPositionsSet()) {
       schema.setEncodingPositions(encodingLocationMap);
     }
@@ -429,15 +466,22 @@ public class SchemaTranslation {
         } else if (urn.equals(URN_BEAM_LOGICAL_DECIMAL)) {
           return FieldType.DECIMAL;
         } else if (urn.startsWith("beam:logical_type:")) {
-          try {
-            return FieldType.logicalType(
-                (LogicalType)
-                    SerializableUtils.deserializeFromByteArray(
-                        logicalType.getPayload().toByteArray(), "logicalType"));
-          } catch (IllegalArgumentException e) {
-            LOG.warn(
-                "Unable to deserialize the logical type {} from proto. Mark as UnknownLogicalType.",
-                urn);
+          if (!logicalType.getPayload().isEmpty()) {
+            // logical type has a payload, try to recover the instance by deserialization
+            try {
+              return FieldType.logicalType(
+                  (LogicalType)
+                      SerializableUtils.deserializeFromByteArray(
+                          logicalType.getPayload().toByteArray(), "logicalType"));
+            } catch (IllegalArgumentException e) {
+              LOG.warn(
+                  "Unable to deserialize the logical type {} from proto. Mark as UnknownLogicalType.",
+                  urn);
+            }
+          } else {
+            // logical type does not have a payload. This happens when it is passed xlang.
+            // TODO(yathu) it appears this path is called heavily, consider cache the instance
+            LOG.debug("Constructing non-standard logical type {} as UnknownLogicalType", urn);
           }
         }
         // assemble an UnknownLogicalType
@@ -751,7 +795,8 @@ public class SchemaTranslation {
       protoOptions.add(
           SchemaApi.Option.newBuilder()
               .setName(name)
-              .setType(fieldTypeToProto(Objects.requireNonNull(options.getType(name)), false))
+              .setType(
+                  fieldTypeToProto(Objects.requireNonNull(options.getType(name)), false, false))
               .setValue(
                   fieldValueToProto(
                       Objects.requireNonNull(options.getType(name)), options.getValue(name)))

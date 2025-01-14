@@ -20,6 +20,7 @@ import time
 from typing import Any
 from typing import Dict
 from typing import Iterable
+from typing import Mapping
 from typing import Optional
 from typing import Sequence
 
@@ -69,6 +70,10 @@ class VertexAIModelHandlerJSON(ModelHandler[Any,
       experiment: Optional[str] = None,
       network: Optional[str] = None,
       private: bool = False,
+      *,
+      min_batch_size: Optional[int] = None,
+      max_batch_size: Optional[int] = None,
+      max_batch_duration_secs: Optional[int] = None,
       **kwargs):
     """Implementation of the ModelHandler interface for Vertex AI.
     **NOTE:** This API and its implementation are under development and
@@ -97,9 +102,21 @@ class VertexAIModelHandlerJSON(ModelHandler[Any,
       private: optional. if the deployed Vertex AI endpoint is
         private, set to true. Requires a network to be provided
         as well.
+      min_batch_size: optional. the minimum batch size to use when batching
+        inputs.
+      max_batch_size: optional. the maximum batch size to use when batching
+        inputs.
+      max_batch_duration_secs: optional. the maximum amount of time to buffer 
+        a batch before emitting; used in streaming contexts.
     """
-
+    self._batching_kwargs = {}
     self._env_vars = kwargs.get('env_vars', {})
+    if min_batch_size is not None:
+      self._batching_kwargs["min_batch_size"] = min_batch_size
+    if max_batch_size is not None:
+      self._batching_kwargs["max_batch_size"] = max_batch_size
+    if max_batch_duration_secs is not None:
+      self._batching_kwargs["max_batch_duration_secs"] = max_batch_duration_secs
 
     if private and network is None:
       raise ValueError(
@@ -116,9 +133,11 @@ class VertexAIModelHandlerJSON(ModelHandler[Any,
     # Check for liveness here but don't try to actually store the endpoint
     # in the class yet
     self.endpoint_name = endpoint_id
+    self.location = location
     self.is_private = private
 
-    _ = self._retrieve_endpoint(self.endpoint_name, self.is_private)
+    _ = self._retrieve_endpoint(
+        self.endpoint_name, self.location, self.is_private)
 
     # Configure AdaptiveThrottler and throttling metrics for client-side
     # throttling behavior.
@@ -130,7 +149,8 @@ class VertexAIModelHandlerJSON(ModelHandler[Any,
         window_ms=1, bucket_ms=1, overload_ratio=2)
 
   def _retrieve_endpoint(
-      self, endpoint_id: str, is_private: bool) -> aiplatform.Endpoint:
+      self, endpoint_id: str, location: str,
+      is_private: bool) -> aiplatform.Endpoint:
     """Retrieves an AI Platform endpoint and queries it for liveness/deployed
     models.
 
@@ -145,10 +165,11 @@ class VertexAIModelHandlerJSON(ModelHandler[Any,
     """
     if is_private:
       endpoint: aiplatform.Endpoint = aiplatform.PrivateEndpoint(
-          endpoint_name=endpoint_id)
+          endpoint_name=endpoint_id, location=location)
       LOGGER.debug("Treating endpoint %s as private", endpoint_id)
     else:
-      endpoint = aiplatform.Endpoint(endpoint_name=endpoint_id)
+      endpoint = aiplatform.Endpoint(
+          endpoint_name=endpoint_id, location=location)
       LOGGER.debug("Treating endpoint %s as public", endpoint_id)
 
     try:
@@ -168,7 +189,8 @@ class VertexAIModelHandlerJSON(ModelHandler[Any,
     """
     # Check to make sure the endpoint is still active since pipeline
     # construction time
-    ep = self._retrieve_endpoint(self.endpoint_name, self.is_private)
+    ep = self._retrieve_endpoint(
+        self.endpoint_name, self.location, self.is_private)
     return ep
 
   @retry.with_exponential_backoff(
@@ -228,3 +250,9 @@ class VertexAIModelHandlerJSON(ModelHandler[Any,
 
     return utils._convert_to_result(
         batch, prediction.predictions, prediction.deployed_model_id)
+
+  def validate_inference_args(self, inference_args: Optional[Dict[str, Any]]):
+    pass
+
+  def batch_elements_kwargs(self) -> Mapping[str, Any]:
+    return self._batching_kwargs

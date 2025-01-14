@@ -17,17 +17,21 @@
  */
 package org.apache.beam.sdk.values;
 
+import static org.apache.beam.sdk.util.Preconditions.checkStateNotNull;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
+import java.util.function.Function;
 import org.apache.beam.sdk.annotations.Internal;
 import org.apache.beam.sdk.schemas.Factory;
 import org.apache.beam.sdk.schemas.FieldValueGetter;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.schemas.Schema.Field;
 import org.apache.beam.sdk.schemas.Schema.TypeName;
+import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
@@ -38,21 +42,21 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * the appropriate fields from the POJO.
  */
 @SuppressWarnings("rawtypes")
-public class RowWithGetters extends Row {
-  private final Object getterTarget;
-  private final List<FieldValueGetter> getters;
-  private @Nullable Map<Integer, Object> cache = null;
+public class RowWithGetters<T extends @NonNull Object> extends Row {
+  private final T getterTarget;
+  private final List<FieldValueGetter<T, Object>> getters;
+  private @Nullable Map<Integer, @Nullable Object> cache = null;
 
   RowWithGetters(
-      Schema schema, Factory<List<FieldValueGetter>> getterFactory, Object getterTarget) {
+      Schema schema, Factory<List<FieldValueGetter<T, Object>>> getterFactory, T getterTarget) {
     super(schema);
     this.getterTarget = getterTarget;
-    this.getters = getterFactory.create(getterTarget.getClass(), schema);
+    this.getters = getterFactory.create(TypeDescriptor.of(getterTarget.getClass()), schema);
   }
 
   @Override
   @SuppressWarnings({"TypeParameterUnusedInFormals", "unchecked"})
-  public <T> @Nullable T getValue(int fieldIdx) {
+  public <W> W getValue(int fieldIdx) {
     Field field = getSchema().getField(fieldIdx);
     boolean cacheField = cacheFieldType(field);
 
@@ -60,12 +64,22 @@ public class RowWithGetters extends Row {
       cache = new TreeMap<>();
     }
 
-    Object fieldValue;
+    @Nullable Object fieldValue;
     if (cacheField) {
       if (cache == null) {
         cache = new TreeMap<>();
       }
-      fieldValue = cache.computeIfAbsent(fieldIdx, idx -> getters.get(idx).get(getterTarget));
+      fieldValue =
+          cache.computeIfAbsent(
+              fieldIdx,
+              new Function<Integer, @Nullable Object>() {
+                @Override
+                public @Nullable Object apply(Integer idx) {
+                  FieldValueGetter<T, Object> getter = getters.get(idx);
+                  checkStateNotNull(getter);
+                  return getter.get(getterTarget);
+                }
+              });
     } else {
       fieldValue = getters.get(fieldIdx).get(getterTarget);
     }
@@ -73,7 +87,7 @@ public class RowWithGetters extends Row {
     if (fieldValue == null && !field.getType().getNullable()) {
       throw new RuntimeException("Null value set on non-nullable field " + field);
     }
-    return (T) fieldValue;
+    return (W) fieldValue;
   }
 
   private boolean cacheFieldType(Field field) {
@@ -99,7 +113,7 @@ public class RowWithGetters extends Row {
     return rawValues;
   }
 
-  public List<FieldValueGetter> getGetters() {
+  public List<FieldValueGetter<T, Object>> getGetters() {
     return getters;
   }
 

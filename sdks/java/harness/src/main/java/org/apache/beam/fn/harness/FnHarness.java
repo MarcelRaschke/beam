@@ -17,12 +17,16 @@
  */
 package org.apache.beam.fn.harness;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -35,7 +39,8 @@ import org.apache.beam.fn.harness.control.HarnessMonitoringInfosInstructionHandl
 import org.apache.beam.fn.harness.control.ProcessBundleHandler;
 import org.apache.beam.fn.harness.data.BeamFnDataGrpcClient;
 import org.apache.beam.fn.harness.debug.DataSampler;
-import org.apache.beam.fn.harness.logging.BeamFnLoggingClient;
+import org.apache.beam.fn.harness.logging.LoggingClient;
+import org.apache.beam.fn.harness.logging.LoggingClientFactory;
 import org.apache.beam.fn.harness.state.BeamFnStateGrpcClientCache;
 import org.apache.beam.fn.harness.status.BeamFnStatusClient;
 import org.apache.beam.fn.harness.stream.HarnessStreamObserverFactories;
@@ -44,7 +49,6 @@ import org.apache.beam.model.fnexecution.v1.BeamFnApi.InstructionRequest;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.ProcessBundleDescriptor;
 import org.apache.beam.model.fnexecution.v1.BeamFnControlGrpc;
 import org.apache.beam.model.pipeline.v1.Endpoints;
-import org.apache.beam.runners.core.construction.PipelineOptionsTranslation;
 import org.apache.beam.runners.core.metrics.MetricsContainerImpl;
 import org.apache.beam.runners.core.metrics.ShortIdMap;
 import org.apache.beam.sdk.fn.IdGenerator;
@@ -59,8 +63,11 @@ import org.apache.beam.sdk.metrics.MetricsEnvironment;
 import org.apache.beam.sdk.options.ExecutorOptions;
 import org.apache.beam.sdk.options.ExperimentalOptions;
 import org.apache.beam.sdk.options.PipelineOptions;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.TextFormat;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.ManagedChannel;
+import org.apache.beam.sdk.options.SdkHarnessOptions;
+import org.apache.beam.sdk.util.construction.CoderTranslation;
+import org.apache.beam.sdk.util.construction.PipelineOptionsTranslation;
+import org.apache.beam.vendor.grpc.v1p60p1.com.google.protobuf.TextFormat;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.ManagedChannel;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableSet;
@@ -97,7 +104,6 @@ public class FnHarness {
   private static final String PIPELINE_OPTIONS_FILE = "PIPELINE_OPTIONS_FILE";
   private static final String PIPELINE_OPTIONS = "PIPELINE_OPTIONS";
   private static final String RUNNER_CAPABILITIES = "RUNNER_CAPABILITIES";
-  private static final String ENABLE_DATA_SAMPLING_EXPERIMENT = "enable_data_sampling";
   private static final Logger LOG = LoggerFactory.getLogger(FnHarness.class);
 
   private static Endpoints.ApiServiceDescriptor getApiServiceDescriptor(String descriptor)
@@ -106,6 +112,29 @@ public class FnHarness {
         Endpoints.ApiServiceDescriptor.newBuilder();
     TextFormat.merge(descriptor, apiServiceDescriptorBuilder);
     return apiServiceDescriptorBuilder.build();
+  }
+
+  public static String removeNestedKey(String jsonString, String keyToRemove) throws Exception {
+    ObjectMapper mapper = new ObjectMapper();
+    JsonNode rootNode = mapper.readTree(jsonString);
+
+    removeKeyRecursively(rootNode, keyToRemove);
+
+    return mapper.writeValueAsString(rootNode);
+  }
+
+  private static void removeKeyRecursively(JsonNode node, String keyToRemove) {
+    if (node.isObject()) {
+      Iterator<Map.Entry<String, JsonNode>> iterator = node.fields();
+      while (iterator.hasNext()) {
+        Map.Entry<String, JsonNode> field = iterator.next();
+        if (field.getKey().equals(keyToRemove)) {
+          iterator.remove(); // Safe removal using Iterator
+        } else {
+          removeKeyRecursively(field.getValue(), keyToRemove);
+        }
+      }
+    }
   }
 
   public static void main(String[] args) throws Exception {
@@ -145,6 +174,9 @@ public class FnHarness {
     }
 
     System.out.format("Pipeline options %s%n", pipelineOptionsJson);
+    // TODO: https://github.com/apache/beam/issues/30301
+    pipelineOptionsJson = removeNestedKey(pipelineOptionsJson, "impersonateServiceAccount");
+
     PipelineOptions options = PipelineOptionsTranslation.fromJson(pipelineOptionsJson);
 
     Endpoints.ApiServiceDescriptor loggingApiServiceDescriptor =
@@ -248,16 +280,18 @@ public class FnHarness {
         options.as(ExecutorOptions.class).getScheduledExecutorService();
     ExecutionStateSampler executionStateSampler =
         new ExecutionStateSampler(options, System::currentTimeMillis);
-    final DataSampler dataSampler = new DataSampler();
+
+    final @Nullable DataSampler dataSampler = DataSampler.create(options);
 
     // The logging client variable is not used per se, but during its lifetime (until close()) it
     // intercepts logging and sends it to the logging service.
-    try (BeamFnLoggingClient logging =
-        BeamFnLoggingClient.createAndStart(
+    try (LoggingClient logging =
+        LoggingClientFactory.createAndStart(
             options, loggingApiServiceDescriptor, channelFactory::forDescriptor)) {
       LOG.info("Fn Harness started");
       // Register standard file systems.
       FileSystems.setDefaultPipelineOptions(options);
+      CoderTranslation.verifyModelCodersRegistered();
       EnumMap<
               BeamFnApi.InstructionRequest.RequestCase,
               ThrowingFunction<InstructionRequest, BeamFnApi.InstructionResponse.Builder>>
@@ -275,10 +309,6 @@ public class FnHarness {
           new BeamFnStateGrpcClientCache(idGenerator, channelFactory, outboundObserverFactory);
 
       FinalizeBundleHandler finalizeBundleHandler = new FinalizeBundleHandler(executorService);
-
-      // Create the sampler, if the experiment is enabled.
-      boolean shouldSample =
-          ExperimentalOptions.hasExperiment(options, ENABLE_DATA_SAMPLING_EXPERIMENT);
 
       // Retrieves the ProcessBundleDescriptor from cache. Requests the PBD from the Runner if it
       // doesn't exist. Additionally, runs any graph modifications.
@@ -314,8 +344,7 @@ public class FnHarness {
               metricsShortIds,
               executionStateSampler,
               processWideCache,
-              shouldSample ? dataSampler : null);
-      logging.setProcessBundleHandler(processBundleHandler);
+              dataSampler);
 
       BeamFnStatusClient beamFnStatusClient = null;
       if (statusApiServiceDescriptor != null) {
@@ -363,7 +392,12 @@ public class FnHarness {
           InstructionRequest.RequestCase.HARNESS_MONITORING_INFOS,
           processWideHandler::harnessMonitoringInfos);
       handlers.put(
-          InstructionRequest.RequestCase.SAMPLE_DATA, dataSampler::handleDataSampleRequest);
+          InstructionRequest.RequestCase.SAMPLE_DATA,
+          request ->
+              dataSampler == null
+                  ? BeamFnApi.InstructionResponse.newBuilder()
+                      .setSampleData(BeamFnApi.SampleDataResponse.newBuilder())
+                  : dataSampler.handleDataSampleRequest(request));
 
       JvmInitializers.runBeforeProcessing(options);
 
@@ -378,15 +412,20 @@ public class FnHarness {
               outboundObserverFactory,
               executorService,
               handlers);
-      CompletableFuture.anyOf(control.terminationFuture(), logging.terminationFuture()).get();
+      if (options.as(SdkHarnessOptions.class).getEnableLogViaFnApi()) {
+        CompletableFuture.anyOf(control.terminationFuture(), logging.terminationFuture()).get();
+      } else {
+        control.terminationFuture().get();
+      }
       if (beamFnStatusClient != null) {
         beamFnStatusClient.close();
       }
       processBundleHandler.shutdown();
     } catch (Exception e) {
-      System.out.println("Shutting down harness due to exception: " + e.toString());
+      LOG.error("Shutting down harness due to exception", e);
+      e.printStackTrace();
     } finally {
-      System.out.println("Shutting SDK harness down.");
+      LOG.info("Shutting SDK harness down.");
       executionStateSampler.stop();
       executorService.shutdown();
     }

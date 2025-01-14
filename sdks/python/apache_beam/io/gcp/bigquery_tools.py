@@ -32,6 +32,7 @@ import decimal
 import io
 import json
 import logging
+import re
 import sys
 import time
 import uuid
@@ -339,6 +340,9 @@ class BigQueryWrapper(object):
   offer a common place where retry logic for failures can be controlled.
   In addition, it offers various functions used both in sources and sinks
   (e.g., find and create tables, query a table, etc.).
+
+  Note that client parameter in constructor is only for testing purposes and
+  should not be used in production code.
   """
 
   # If updating following names, also update the corresponding pydocs in
@@ -353,6 +357,7 @@ class BigQueryWrapper(object):
     self.gcp_bq_client = client or gcp_bigquery.Client(
         client_info=ClientInfo(
             user_agent="apache-beam-%s" % apache_beam.__version__))
+
     self._unique_row_id = 0
     # For testing scenarios where we pass in a client we do not want a
     # randomized prefix for row IDs.
@@ -554,9 +559,22 @@ class BigQueryWrapper(object):
         ))
     return self._start_job(request, stream=source_stream).jobReference
 
+  @staticmethod
+  def _parse_location_from_exc(content, job_id):
+    """Parse job location from Exception content."""
+    if isinstance(content, bytes):
+      content = content.decode('ascii', 'replace')
+    # search for "Already Exists: Job <project-id>:<location>.<job id>"
+    m = re.search(r"Already Exists: Job \S+\:(\S+)\." + job_id, content)
+    if not m:
+      _LOGGER.warning(
+          "Not able to parse BigQuery load job location for %s", job_id)
+      return None
+    return m.group(1)
+
   def _start_job(
       self,
-      request,  # type: bigquery.BigqueryJobsInsertRequest
+      request: 'bigquery.BigqueryJobsInsertRequest',
       stream=None,
   ):
     """Inserts a BigQuery job.
@@ -581,11 +599,17 @@ class BigQueryWrapper(object):
       return response
     except HttpError as exn:
       if exn.status_code == 409:
+        jobId = request.job.jobReference.jobId
         _LOGGER.info(
             "BigQuery job %s already exists, will not retry inserting it: %s",
             request.job.jobReference,
             exn)
-        return request.job
+        job_location = self._parse_location_from_exc(exn.content, jobId)
+        response = request.job
+        if not response.jobReference.location and job_location:
+          # Request not constructed with location
+          response.jobReference.location = job_location
+        return response
       else:
         _LOGGER.info(
             "Failed to insert job %s: %s", request.job.jobReference, exn)
@@ -645,7 +669,7 @@ class BigQueryWrapper(object):
       retry += 1
       job = self.get_job(
           job_reference.projectId, job_reference.jobId, job_reference.location)
-      logging.info('Job %s status: %s', job.id, job.status.state)
+      _LOGGER.info('Job %s status: %s', job.id, job.status.state)
       if job.status.state == 'DONE' and job.status.errorResult:
         raise RuntimeError(
             'BigQuery job {} failed. Error Result: {}'.format(
@@ -732,11 +756,13 @@ class BigQueryWrapper(object):
     except (ClientError, GoogleAPICallError) as e:
       # e.code contains the numeric http status code.
       service_call_metric.call(e.code)
-      # Re-reise the exception so that we re-try appropriately.
-      raise
+      # Package exception with required fields
+      error = {'message': e.message, 'reason': e.response.reason}
+      # Add all rows to the errors list along with the error
+      errors = [{"index": i, "errors": [error]} for i, _ in enumerate(rows)]
     except HttpError as e:
       service_call_metric.call(e)
-      # Re-reise the exception so that we re-try appropriately.
+      # Re-raise the exception so that we re-try appropriately.
       raise
     finally:
       self._latency_histogram_metric.update(
@@ -745,7 +771,7 @@ class BigQueryWrapper(object):
 
   @retry.with_exponential_backoff(
       num_retries=MAX_RETRIES,
-      retry_filter=retry.retry_on_server_errors_and_timeout_filter)
+      retry_filter=retry.retry_on_server_errors_timeout_or_quota_issues_filter)
   def get_table(self, project_id, dataset_id, table_id):
     """Lookup a table's metadata object.
 
@@ -1491,7 +1517,19 @@ class RetryStrategy(object):
   RETRY_NEVER = 'RETRY_NEVER'
   RETRY_ON_TRANSIENT_ERROR = 'RETRY_ON_TRANSIENT_ERROR'
 
-  _NON_TRANSIENT_ERRORS = {'invalid', 'invalidQuery', 'notImplemented'}
+  # Values below may be found in reasons provided either in an
+  # error returned by a client method or by an http response as
+  # defined in google.api_core.exceptions
+  _NON_TRANSIENT_ERRORS = {
+      'invalid',
+      'invalidQuery',
+      'notImplemented',
+      'Bad Request',
+      'Unauthorized',
+      'Forbidden',
+      'Not Found',
+      'Not Implemented',
+  }
 
   @staticmethod
   def should_retry(strategy, error_message):
@@ -1558,23 +1596,32 @@ bigquery_v2_messages.TableSchema):
   """
   if not isinstance(schema, (bigquery.TableSchema, bigquery.TableFieldSchema)):
     schema = get_bq_tableschema(schema)
-  schema_fields = {field.name: field for field in schema.fields}
   beam_row = {}
-  for col_name, value in row.items():
-    # get this column's schema field and handle struct types
-    field = schema_fields[col_name]
-    if field.type.upper() in ["RECORD", "STRUCT"]:
+  for field in schema.fields:
+    name = field.name
+    mode = field.mode.upper()
+    type = field.type.upper()
+    # When writing with Storage Write API via xlang, we give the Beam Row
+    # PCollection a hint on the schema using `with_output_types`.
+    # This requires that each row has all the fields in the schema.
+    # However, it's possible that some nullable fields don't appear in the row.
+    # For this case, we create the field with a `None` value
+    if name not in row and mode == "NULLABLE":
+      row[name] = None
+
+    value = row[name]
+    if type in ["RECORD", "STRUCT"]:
       # if this is a list of records, we create a list of Beam Rows
-      if field.mode.upper() == "REPEATED":
+      if mode == "REPEATED":
         list_of_beam_rows = []
         for record in value:
           list_of_beam_rows.append(beam_row_from_dict(record, field))
-        beam_row[col_name] = list_of_beam_rows
+        beam_row[name] = list_of_beam_rows
       # otherwise, create a Beam Row from this record
       else:
-        beam_row[col_name] = beam_row_from_dict(value, field)
+        beam_row[name] = beam_row_from_dict(value, field)
     else:
-      beam_row[col_name] = value
+      beam_row[name] = value
   return apache_beam.pvalue.Row(**beam_row)
 
 
@@ -1584,7 +1631,7 @@ def get_table_schema_from_string(schema):
 bigquery_v2_messages.TableSchema` instance.
 
   Args:
-    schema (str): The sting schema to be used if the BigQuery table to write
+    schema (str): The string schema to be used if the BigQuery table to write
       has to be created.
 
   Returns:
@@ -1755,9 +1802,11 @@ def generate_bq_job_name(job_name, step_id, job_type, random=None):
 
 
 def check_schema_equal(
-    left, right, *, ignore_descriptions=False, ignore_field_order=False):
-  # type: (Union[bigquery.TableSchema, bigquery.TableFieldSchema], Union[bigquery.TableSchema, bigquery.TableFieldSchema], bool, bool) -> bool
-
+    left: Union['bigquery.TableSchema', 'bigquery.TableFieldSchema'],
+    right: Union['bigquery.TableSchema', 'bigquery.TableFieldSchema'],
+    *,
+    ignore_descriptions: bool = False,
+    ignore_field_order: bool = False) -> bool:
   """Check whether schemas are equivalent.
 
   This comparison function differs from using == to compare TableSchema

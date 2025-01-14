@@ -133,7 +133,30 @@ task postCommitIT {
         "test_opts": testOpts,
         "sdk_location": project.ext.sdkLocation,
         "suite": "postCommitIT-df${pythonVersionSuffix}",
-        "collect": "it_postcommit"
+        "collect": "it_postcommit",
+    ]
+    def cmdArgs = mapToArgString(argMap)
+    exec {
+      executable 'sh'
+      args '-c', ". ${envdir}/bin/activate && ${runScriptsDir}/run_integration_test.sh $cmdArgs"
+    }
+  }
+}
+
+task postCommitArmIT {
+  def pyversion = "${project.ext.pythonVersion.replace('.', '')}"
+  dependsOn 'initializeForDataflowJob'
+  dependsOn ":sdks:python:container:py${pyversion}:docker"
+
+  doLast {
+    def testOpts = basicPytestOpts + ["--numprocesses=8", "--dist=loadfile"]
+    def argMap = [
+        "test_opts": testOpts,
+        "sdk_location": project.ext.sdkLocation,
+        "suite": "postCommitIT-df${pythonVersionSuffix}",
+        "collect": "it_postcommit",
+        "py_version": project.ext.pythonVersion,
+        "arch": "ARM"
     ]
     def cmdArgs = mapToArgString(argMap)
     exec {
@@ -357,6 +380,45 @@ task validatesContainer() {
   }
 }
 
+task validatesDistrolessContainer() {
+  def pyversion = "${project.ext.pythonVersion.replace('.', '')}"
+  dependsOn ":sdks:python:container:distroless:py${pyversion}:dockerPush"
+
+  def name = project.docker_image_default_repo_prefix + "python${project.ext.pythonVersion}_sdk_distroless"
+
+  def root = project.rootProject.hasProperty(["docker-repository-root"]) ?
+    project.rootProject["docker-repository-root"] :
+    project.docker_image_default_repo_root
+
+  def tag = project.rootProject.hasProperty(["docker-tag"]) ?
+    project.rootProject["docker-tag"] : project.sdk_version
+
+  def imageURL = containerImageName(
+        name: name,
+        root: root,
+        tag: tag)
+
+  doLast {
+    exec {
+        def testTarget = "apache_beam/examples/wordcount_it_test.py::WordCountIT::test_wordcount_it"
+      def argMap = [
+              "output"             : "gs://temp-storage-for-end-to-end-tests/py-it-cloud/output",
+              "project"            : "apache-beam-testing",
+              "region"             : "us-central1",
+              "runner"             : "TestDataflowRunner",
+              "sdk_container_image": "${imageURL}",
+              "sdk_location"       : "container",
+              "staging_location"   : "gs://temp-storage-for-end-to-end-tests/staging-it",
+              "temp_location"      : "gs://temp-storage-for-end-to-end-tests/temp-it",
+      ]
+      def cmdArgs = mapToArgString(argMap)
+      workingDir = "${rootDir}/sdks/python"
+      executable 'sh'
+      args '-c', ". ${envdir}/bin/activate && pytest ${testTarget} --test-pipeline-options=\"${cmdArgs}\""
+    }
+  }
+}
+
 task validatesContainerARM() {
   def pyversion = "${project.ext.pythonVersion.replace('.', '')}"
   dependsOn 'initializeForDataflowJob'
@@ -401,6 +463,39 @@ def tensorRTTests = tasks.create("tensorRTtests") {
  }
 }
 
+def vllmTests = tasks.create("vllmTests") {
+  dependsOn 'installGcpTest'
+  dependsOn ':sdks:python:sdist'
+ doLast {
+  def testOpts = basicPytestOpts
+  def argMap = [
+    "runner": "DataflowRunner",
+    "machine_type":"n1-standard-4",
+    // TODO(https://github.com/apache/beam/issues/22651): Build docker image for VLLM tests during Run time.
+    // This would also enable to use wheel "--sdk_location" as other tasks, and eliminate distTarBall dependency
+    // declaration for this project.
+    // Right now, this is built from https://github.com/apache/beam/blob/master/sdks/python/apache_beam/ml/inference/test_resources/vllm.dockerfile
+    "sdk_container_image": "us.gcr.io/apache-beam-testing/python-postcommit-it/vllm:latest",
+    "sdk_location": files(configurations.distTarBall.files).singleFile,
+    "project": "apache-beam-testing",
+    "region": "us-central1",
+    "model": "facebook/opt-125m",
+    "output": "gs://apache-beam-ml/outputs/vllm_predictions.txt",
+    "disk_size_gb": 75
+  ]
+  def cmdArgs = mapToArgString(argMap)
+  // Exec one version with and one version without the chat option
+  exec {
+    executable 'sh'
+    args '-c', ". ${envdir}/bin/activate && pip install openai && python -m apache_beam.examples.inference.vllm_text_completion $cmdArgs --experiment='worker_accelerator=type:nvidia-tesla-t4;count:1;install-nvidia-driver:5xx'"
+  }
+  exec {
+    executable 'sh'
+    args '-c', ". ${envdir}/bin/activate && pip install openai && python -m apache_beam.examples.inference.vllm_text_completion $cmdArgs --chat true --chat_template 'gs://apache-beam-ml/additional_files/sample_chat_template.jinja' --experiment='worker_accelerator=type:nvidia-tesla-t4;count:1;install-nvidia-driver:5xx'"
+  }
+ }
+}
+
 // Vertex AI RunInference IT tests
 task vertexAIInferenceTest {
   dependsOn 'initializeForDataflowJob'
@@ -417,8 +512,9 @@ task vertexAIInferenceTest {
       def argMap = [
           "test_opts": testOpts,
           "suite": "VertexAITests-df-py${pythonVersionSuffix}",
-          "collect": "uses_vertex_ai and it_postcommit" ,
-          "runner": "TestDataflowRunner"
+          "collect": "vertex_ai_postcommit" ,
+          "runner": "TestDataflowRunner",
+          "requirements_file": "$requirementsFile"
       ]
       def cmdArgs = mapToArgString(argMap)
       exec {
@@ -463,37 +559,67 @@ task tftTests {
   }
 }
 
+// Tests that depend on Mock API:https://github.com/apache/beam/tree/master/.test-infra/mock-apis. .
+task mockAPITests {
+  dependsOn 'initializeForDataflowJob'
+  dependsOn ':sdks:python:sdist'
+
+ doLast {
+  def testOpts = basicTestOpts
+  def argMap = [
+    "test_opts": testOpts,
+    "collect": "uses_mock_api",
+    "runner": "TestDataflowRunner",
+    "project": "apache-beam-testing",
+    "region": "us-west1",
+  ]
+  def cmdArgs = mapToArgString(argMap)
+  exec {
+    executable 'sh'
+	args '-c', ". ${envdir}/bin/activate && ${runScriptsDir}/run_integration_test.sh $cmdArgs"
+  }
+ }
+}
+
 // add all RunInference E2E tests that run on DataflowRunner
-// As of now, this test suite is enable in py38 suite as the base NVIDIA image used for Tensor RT
-// contains Python 3.8.
+// As of now, this test suite is enable in py310 suite as the base NVIDIA image used for Tensor RT
+// contains Python 3.10.
 // TODO: https://github.com/apache/beam/issues/22651
 project.tasks.register("inferencePostCommitIT") {
   dependsOn = [
-  'tensorRTtests',
+  // TODO(https://github.com/apache/beam/issues/33078): restore the tensorRT tests once the staged
+  // model is fixed.
+  // 'tensorRTtests',
   'vertexAIInferenceTest',
+  'mockAPITests',
+  ]
+}
+
+project.tasks.register("inferencePostCommitITPy312") {
+  dependsOn = [
+  'vllmTests',
   ]
 }
 
 
 // Create cross-language tasks for running tests against Java expansion service(s)
-def dataflowProject = project.findProperty('dataflowProject') ?: 'apache-beam-testing'
-def dataflowRegion = project.findProperty('dataflowRegion') ?: 'us-central1'
+def gcpProject = project.findProperty('gcpProject') ?: 'apache-beam-testing'
+def gcpRegion = project.findProperty('gcpRegion') ?: 'us-central1'
 
 project(":sdks:python:test-suites:xlang").ext.xlangTasks.each { taskMetadata ->
     createCrossLanguageUsingJavaExpansionTask(
       name: taskMetadata.name,
-      expansionProjectPath: taskMetadata.expansionProjectPath,
+      expansionProjectPaths: taskMetadata.expansionProjectPaths,
       collectMarker: taskMetadata.collectMarker,
-      startJobServer: taskMetadata.startJobServer,
-      cleanupJobServer: taskMetadata.cleanupJobServer,
       pythonPipelineOptions: [
         "--runner=TestDataflowRunner",
-        "--project=${dataflowProject}",
-        "--region=${dataflowRegion}",
+        "--project=${gcpProject}",
+        "--region=${gcpRegion}",
         "--sdk_container_image=gcr.io/apache-beam-testing/beam-sdk/beam_python${project.ext.pythonVersion}_sdk:latest",
         "--sdk_harness_container_image_overrides=.*java.*,gcr.io/apache-beam-testing/beam-sdk/beam_java8_sdk:latest"
       ],
       pytestOptions: basicPytestOpts,
+      additionalDeps: taskMetadata.additionalDeps,
       additionalEnvs: taskMetadata.additionalEnvs
     )
 }

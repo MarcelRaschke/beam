@@ -78,10 +78,14 @@ import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.display.DisplayData;
+import org.apache.beam.sdk.transforms.errorhandling.BadRecord;
+import org.apache.beam.sdk.transforms.errorhandling.ErrorHandler;
+import org.apache.beam.sdk.transforms.errorhandling.ErrorHandlingTestUtils.ErrorSinkTransform;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.MoreCollectors;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -303,6 +307,7 @@ public class BigQueryIOStorageQueryTest {
             /* priority = */ QueryPriority.INTERACTIVE,
             /* location = */ null,
             /* queryTempDataset = */ null,
+            /* queryTempProject = */ null,
             /* kmsKey = */ null,
             null,
             new TableRowParser(),
@@ -376,7 +381,8 @@ public class BigQueryIOStorageQueryTest {
             .setParent("projects/" + options.getProject())
             .setReadSession(
                 ReadSession.newBuilder()
-                    .setTable(BigQueryHelpers.toTableResourceName(tempTableReference)))
+                    .setTable(BigQueryHelpers.toTableResourceName(tempTableReference))
+                    .setReadOptions(ReadSession.TableReadOptions.newBuilder()))
             .setMaxStreamCount(requestedStreamCount)
             .build();
 
@@ -415,6 +421,7 @@ public class BigQueryIOStorageQueryTest {
             /* priority = */ QueryPriority.BATCH,
             /* location = */ null,
             /* queryTempDataset = */ null,
+            /* queryTempProject = */ null,
             /* kmsKey = */ null,
             null,
             new TableRowParser(),
@@ -426,6 +433,12 @@ public class BigQueryIOStorageQueryTest {
 
     List<? extends BoundedSource<TableRow>> sources = querySource.split(bundleSize, options);
     assertEquals(expectedStreamCount, sources.size());
+    assertEquals(
+        TableRowJsonCoder.of(),
+        sources.stream()
+            .map(BoundedSource<TableRow>::getOutputCoder)
+            .distinct()
+            .collect(MoreCollectors.onlyElement()));
   }
 
   /**
@@ -470,7 +483,8 @@ public class BigQueryIOStorageQueryTest {
             .setParent("projects/" + options.getProject())
             .setReadSession(
                 ReadSession.newBuilder()
-                    .setTable(BigQueryHelpers.toTableResourceName(tempTableReference)))
+                    .setTable(BigQueryHelpers.toTableResourceName(tempTableReference))
+                    .setReadOptions(ReadSession.TableReadOptions.newBuilder()))
             .setMaxStreamCount(1024)
             .build();
 
@@ -509,6 +523,7 @@ public class BigQueryIOStorageQueryTest {
             /* priority = */ QueryPriority.BATCH,
             /* location = */ null,
             /* queryTempDataset = */ null,
+            /* queryTempProject = */ null,
             /* kmsKey = */ null,
             null,
             new TableRowParser(),
@@ -520,6 +535,12 @@ public class BigQueryIOStorageQueryTest {
 
     List<? extends BoundedSource<TableRow>> sources = querySource.split(1024, options);
     assertEquals(1024, sources.size());
+    assertEquals(
+        TableRowJsonCoder.of(),
+        sources.stream()
+            .map(BoundedSource<TableRow>::getOutputCoder)
+            .distinct()
+            .collect(MoreCollectors.onlyElement()));
   }
 
   private static final String AVRO_SCHEMA_STRING =
@@ -633,7 +654,8 @@ public class BigQueryIOStorageQueryTest {
             .setReadSession(
                 ReadSession.newBuilder()
                     .setTable(BigQueryHelpers.toTableResourceName(tempTableReference))
-                    .setDataFormat(DataFormat.AVRO))
+                    .setDataFormat(DataFormat.AVRO)
+                    .setReadOptions(ReadSession.TableReadOptions.newBuilder()))
             .setMaxStreamCount(10)
             .build();
 
@@ -650,6 +672,7 @@ public class BigQueryIOStorageQueryTest {
             /* priority = */ QueryPriority.BATCH,
             /* location = */ null,
             /* queryTempDataset = */ null,
+            /* queryTempProject = */ null,
             /* kmsKey = */ null,
             DataFormat.AVRO,
             new TableRowParser(),
@@ -704,7 +727,8 @@ public class BigQueryIOStorageQueryTest {
             .setParent("projects/" + options.getProject())
             .setReadSession(
                 ReadSession.newBuilder()
-                    .setTable(BigQueryHelpers.toTableResourceName(tempTableReference)))
+                    .setTable(BigQueryHelpers.toTableResourceName(tempTableReference))
+                    .setReadOptions(ReadSession.TableReadOptions.newBuilder()))
             .setMaxStreamCount(10)
             .build();
 
@@ -721,6 +745,7 @@ public class BigQueryIOStorageQueryTest {
             /* priority = */ QueryPriority.BATCH,
             /* location = */ null,
             /* queryTempDataset = */ null,
+            /* queryTempProject = */ null,
             /* kmsKey = */ null,
             null,
             new TableRowParser(),
@@ -745,6 +770,7 @@ public class BigQueryIOStorageQueryTest {
             /* priority = */ QueryPriority.INTERACTIVE,
             /* location = */ "asia-northeast1",
             /* queryTempDataset = */ null,
+            /* queryTempProject = */ null,
             /* kmsKey = */ null,
             null,
             new TableRowParser(),
@@ -756,18 +782,8 @@ public class BigQueryIOStorageQueryTest {
     querySource.createReader(options);
   }
 
-  @Test
-  public void testReadFromBigQueryIO() throws Exception {
-    doReadFromBigQueryIO(false);
-  }
-
-  @Test
-  public void testReadFromBigQueryIOWithTemplateCompatibility() throws Exception {
-    doReadFromBigQueryIO(true);
-  }
-
-  private void doReadFromBigQueryIO(boolean templateCompatibility) throws Exception {
-
+  public TypedRead<KV<String, Long>> configureTypedRead(
+      SerializableFunction<SchemaAndRecord, KV<String, Long>> parseFn) throws Exception {
     TableReference sourceTableRef = BigQueryHelpers.parseTableSpec("project:dataset.table");
 
     fakeDatasetService.createDataset(
@@ -827,15 +843,29 @@ public class BigQueryIOStorageQueryTest {
     when(fakeStorageClient.readRows(expectedReadRowsRequest, ""))
         .thenReturn(new FakeBigQueryServerStream<>(readRowsResponses));
 
-    BigQueryIO.TypedRead<KV<String, Long>> typedRead =
-        BigQueryIO.read(new ParseKeyValue())
-            .fromQuery(encodedQuery)
-            .withMethod(Method.DIRECT_READ)
-            .withTestServices(
-                new FakeBigQueryServices()
-                    .withDatasetService(fakeDatasetService)
-                    .withJobService(fakeJobService)
-                    .withStorageClient(fakeStorageClient));
+    return BigQueryIO.read(parseFn)
+        .fromQuery(encodedQuery)
+        .withMethod(Method.DIRECT_READ)
+        .withTestServices(
+            new FakeBigQueryServices()
+                .withDatasetService(fakeDatasetService)
+                .withJobService(fakeJobService)
+                .withStorageClient(fakeStorageClient));
+  }
+
+  @Test
+  public void testReadFromBigQueryIO() throws Exception {
+    doReadFromBigQueryIO(false);
+  }
+
+  @Test
+  public void testReadFromBigQueryIOWithTemplateCompatibility() throws Exception {
+    doReadFromBigQueryIO(true);
+  }
+
+  private void doReadFromBigQueryIO(boolean templateCompatibility) throws Exception {
+
+    BigQueryIO.TypedRead<KV<String, Long>> typedRead = configureTypedRead(new ParseKeyValue());
 
     if (templateCompatibility) {
       typedRead = typedRead.withTemplateCompatibility();
@@ -846,6 +876,37 @@ public class BigQueryIOStorageQueryTest {
     PAssert.that(output)
         .containsInAnyOrder(
             ImmutableList.of(KV.of("A", 1L), KV.of("B", 2L), KV.of("C", 3L), KV.of("D", 4L)));
+
+    p.run();
+  }
+
+  private static final class FailingParseKeyValue
+      implements SerializableFunction<SchemaAndRecord, KV<String, Long>> {
+    @Override
+    public KV<String, Long> apply(SchemaAndRecord input) {
+      if (input.getRecord().get("name").toString().equals("B")) {
+        throw new RuntimeException("ExpectedException");
+      }
+      return KV.of(
+          input.getRecord().get("name").toString(), (Long) input.getRecord().get("number"));
+    }
+  }
+
+  @Test
+  public void testReadFromBigQueryWithExceptionHandling() throws Exception {
+
+    TypedRead<KV<String, Long>> typedRead = configureTypedRead(new FailingParseKeyValue());
+
+    ErrorHandler<BadRecord, PCollection<Long>> errorHandler =
+        p.registerBadRecordErrorHandler(new ErrorSinkTransform());
+    typedRead = typedRead.withErrorHandler(errorHandler);
+    PCollection<KV<String, Long>> output = p.apply(typedRead);
+    errorHandler.close();
+
+    PAssert.that(output)
+        .containsInAnyOrder(ImmutableList.of(KV.of("A", 1L), KV.of("C", 3L), KV.of("D", 4L)));
+
+    PAssert.thatSingleton(errorHandler.getOutput()).isEqualTo(1L);
 
     p.run();
   }

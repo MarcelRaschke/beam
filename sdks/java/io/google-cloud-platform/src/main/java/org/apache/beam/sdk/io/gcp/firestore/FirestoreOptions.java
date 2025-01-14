@@ -17,6 +17,7 @@
  */
 package org.apache.beam.sdk.io.gcp.firestore;
 
+import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
 import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptions;
@@ -66,7 +67,7 @@ public interface FirestoreOptions extends PipelineOptions {
    */
   @Description("Firestore endpoint (host and port)")
   @Default.String("batch-firestore.googleapis.com:443")
-  String getHost();
+  String getFirestoreHost();
 
   /**
    * Define a host port pair to allow connecting to a Cloud Firestore instead of the default live
@@ -74,5 +75,15 @@ public interface FirestoreOptions extends PipelineOptions {
    *
    * @param host the host and port to connect to
    */
-  void setHost(String host);
+  void setFirestoreHost(String host);
+
+  /** The Firestore project ID to connect to. */
+  @Description("Firestore project ID")
+  @Nullable
+  String getFirestoreProject();
+
+  /**
+   * Set the Firestore project ID, it will override the value from {@link GcpOptions#getProject()}.
+   */
+  void setFirestoreProject(String firestoreProject);
 }
