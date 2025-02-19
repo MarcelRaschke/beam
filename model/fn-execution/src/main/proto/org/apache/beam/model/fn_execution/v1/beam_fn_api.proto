@@ -52,7 +52,7 @@ import "google/protobuf/duration.proto";
 message FnApiTransforms {
   enum Runner {
     // DataSource is a Root Transform, and a source of data for downstream
-    // transforms in the same ProcessBundleDescriptor. 
+    // transforms in the same ProcessBundleDescriptor.
     // It represents a stream of values coming in from an external source/over
     // a data channel, typically from the runner. It's not the PCollection itself
     // but a description of how to get the portion of the PCollection for a given
@@ -82,7 +82,7 @@ message FnApiTransforms {
     // request will be sent with the matching instruction ID and transform ID.
     // Each PCollection that exits the ProcessBundleDescriptor subgraph will have
     // it's own DataSink, keyed by a transform ID determined by the runner.
-    //  
+    //
     // The DataSink will take in a stream of elements for a given instruction ID
     // and encode them for transmission to the remote sink. The coder ID must be
     // for a windowed value coder.
@@ -503,6 +503,11 @@ message ProcessBundleProgressResponse {
   // as the MonitoringInfo could be reconstructed fully by overwriting its
   // payload field with the bytes specified here.
   map<string, bytes> monitoring_data = 5;
+  // Indicates that the SDK is still busy consuming the data that as already
+  // been received on the data channel. If this is set, a runner may abstain
+  // from sending further data on the data channel until this field becomes
+  // unset. This field is currently used during shuffle reads on large elements.
+  optional bool consuming_received_data = 6;
 
   reserved 1, 2, 4;
 }
@@ -924,6 +929,35 @@ message StateKey {
     bytes window = 3;
   }
 
+  // Represents a request for the keys and values associated with a specified window in a PCollection. See
+  // https://s.apache.org/beam-fn-state-api-and-bundle-processing for further
+  // details.
+  //
+  // This is expected to be more efficient than iterating over they keys and
+  // looking up the values one at a time.  If a runner chooses not to implement
+  // this protocol, or a key has too many values to fit into a single response,
+  // the runner is free to fail the request and a fallback to point lookups
+  // will be performed by the SDK.
+  //
+  // Can only be used to perform StateGetRequests on side inputs of the URN
+  // beam:side_input:multimap:v1.
+  //
+  // For a PCollection<KV<K, V>>, the response data stream will be a
+  // concatenation of all KVs associated with the specified window,
+  // encoded with the the KV<K, Iterable<V>> coder.
+  // See
+  // https://s.apache.org/beam-fn-api-send-and-receive-data for further
+  // details.
+  message MultimapKeysValuesSideInput {
+    // (Required) The id of the PTransform containing a side input.
+    string transform_id = 1;
+    // (Required) The id of the side input.
+    string side_input_id = 2;
+    // (Required) The window (after mapping the currently executing elements
+    // window into the side input windows domain) encoded in a nested context.
+    bytes window = 3;
+  }
+
   // Represents a request for an unordered set of values associated with a
   // specified user key and window for a PTransform. See
   // https://s.apache.org/beam-fn-state-api-and-bundle-processing for further
@@ -992,6 +1026,29 @@ message StateKey {
     bytes map_key = 5;
   }
 
+  // Represents a request for an ordered list of values associated with a
+  // specified user key and window for a PTransform. See
+  // https://s.apache.org/beam-fn-state-api-and-bundle-processing for further
+  // details.
+  //
+  // The response data stream will be a concatenation of all entries of sort key
+  // and V's associated with the specified user key and window.
+  // See https://s.apache.org/beam-fn-api-send-and-receive-data for further
+  // details.
+  message OrderedListUserState {
+    // (Required) The id of the PTransform containing user state.
+    string transform_id = 1;
+    // (Required) The id of the user state.
+    string user_state_id = 2;
+    // (Required) The window encoded in a nested context.
+    bytes window = 3;
+    // (Required) The key of the currently executing element encoded in a
+    // nested context.
+    bytes key = 4;
+    // (Required) The sort range encoded in a nested context.
+    OrderedListRange range = 5;
+  }
+
   // (Required) One of the following state keys must be set.
   oneof type {
     Runner runner = 1;
@@ -999,8 +1056,10 @@ message StateKey {
     BagUserState bag_user_state = 3;
     IterableSideInput iterable_side_input = 4;
     MultimapKeysSideInput multimap_keys_side_input = 5;
+    MultimapKeysValuesSideInput multimap_keys_values_side_input = 8;
     MultimapKeysUserState multimap_keys_user_state = 6;
     MultimapUserState multimap_user_state = 7;
+    OrderedListUserState ordered_list_user_state = 9;
   }
 }
 
@@ -1025,6 +1084,8 @@ message StateGetResponse {
   // Represents a part of a logical byte stream. Elements within
   // the logical byte stream are encoded in the nested context and
   // concatenated together.
+  //
+  // See also the note about OrderedListState in StateAppendRequest.
   bytes data = 2;
 }
 
@@ -1033,6 +1094,11 @@ message StateAppendRequest {
   // Represents a part of a logical byte stream. Elements within
   // the logical byte stream are encoded in the nested context and
   // multiple append requests are concatenated together.
+  //
+  // For OrderedListState, elements of should be encoded with the
+  // beam:coder:kv:v1 coder, where the first (key) component must be a
+  // beam:coder:varint:v1 and the second (value) component must be encoded
+  // with a beam:coder:length_prefix:v1 coder.
   bytes data = 1;
 }
 
@@ -1044,6 +1110,12 @@ message StateClearRequest {}
 
 // A response to clear state.
 message StateClearResponse {}
+
+// A message describes a sort key range [start, end).
+message OrderedListRange {
+  int64 start = 1;
+  int64 end = 2;
+}
 
 /*
  * Logging API

@@ -19,6 +19,7 @@ package org.apache.beam.runners.dataflow.worker;
 
 import com.google.api.services.dataflow.model.CounterUpdate;
 import com.google.api.services.dataflow.model.SideInputInfo;
+import java.util.Collections;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import org.apache.beam.runners.core.InMemoryStateInternals;
@@ -39,6 +40,7 @@ import org.apache.beam.runners.dataflow.worker.profiler.ScopedProfiler;
 import org.apache.beam.runners.dataflow.worker.profiler.ScopedProfiler.ProfileScope;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.metrics.MetricName;
+import org.apache.beam.sdk.metrics.Metrics;
 import org.apache.beam.sdk.metrics.MetricsContainer;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.state.TimeDomain;
@@ -67,9 +69,6 @@ public class BatchModeExecutionContext
   private Object key;
 
   private final MetricsContainerRegistry<MetricsContainerImpl> containerRegistry;
-
-  // TODO(https://github.com/apache/beam/issues/19632): Move throttle time Metric to a dedicated
-  // namespace.
   protected static final String DATASTORE_THROTTLE_TIME_NAMESPACE =
       "org.apache.beam.sdk.io.gcp.datastore.DatastoreV1$DatastoreWriterFn";
   protected static final String HTTP_CLIENT_API_THROTTLE_TIME_NAMESPACE =
@@ -78,7 +77,9 @@ public class BatchModeExecutionContext
       "org.apache.beam.sdk.io.gcp.bigquery.BigQueryServicesImpl$DatasetServiceImpl";
   protected static final String BIGQUERY_READ_THROTTLE_TIME_NAMESPACE =
       "org.apache.beam.sdk.io.gcp.bigquery.BigQueryServicesImpl$StorageClientImpl";
-  protected static final String THROTTLE_TIME_COUNTER_NAME = "throttling-msecs";
+
+  // TODO(BEAM-33720): Remove once Dataflow legacy runner supports BoundedTries.
+  private final boolean populateBoundedTrieMetrics;
 
   private BatchModeExecutionContext(
       CounterFactory counterFactory,
@@ -87,7 +88,8 @@ public class BatchModeExecutionContext
       ReaderFactory readerFactory,
       PipelineOptions options,
       DataflowExecutionStateTracker executionStateTracker,
-      DataflowExecutionStateRegistry executionStateRegistry) {
+      DataflowExecutionStateRegistry executionStateRegistry,
+      boolean populateBoundedTrieMetrics) {
     super(
         counterFactory,
         createMetricsContainerRegistry(),
@@ -100,6 +102,7 @@ public class BatchModeExecutionContext
     this.dataCache = dataCache;
     this.containerRegistry =
         (MetricsContainerRegistry<MetricsContainerImpl>) getMetricsContainerRegistry();
+    this.populateBoundedTrieMetrics = populateBoundedTrieMetrics;
   }
 
   private static MetricsContainerRegistry<MetricsContainerImpl> createMetricsContainerRegistry() {
@@ -135,7 +138,8 @@ public class BatchModeExecutionContext
             counterFactory,
             options,
             "test-work-item-id"),
-        stateRegistry);
+        stateRegistry,
+        true);
   }
 
   public static BatchModeExecutionContext forTesting(PipelineOptions options, String stageName) {
@@ -248,7 +252,8 @@ public class BatchModeExecutionContext
             counterFactory,
             options,
             workItemId),
-        executionStateRegistry);
+        executionStateRegistry,
+        false);
   }
 
   /** Create a new {@link StepContext}. */
@@ -517,6 +522,19 @@ public class BatchModeExecutionContext
                       .transform(
                           update ->
                               MetricsToCounterUpdateConverter.fromDistribution(
+                                  update.getKey(), true, update.getUpdate())),
+                  FluentIterable.from(updates.stringSetUpdates())
+                      .transform(
+                          update ->
+                              MetricsToCounterUpdateConverter.fromStringSet(
+                                  update.getKey(), true, update.getUpdate())),
+                  FluentIterable.from(
+                          populateBoundedTrieMetrics
+                              ? updates.boundedTrieUpdates()
+                              : Collections.emptyList())
+                      .transform(
+                          update ->
+                              MetricsToCounterUpdateConverter.fromBoundedTrie(
                                   update.getKey(), true, update.getUpdate())));
             });
   }
@@ -534,11 +552,18 @@ public class BatchModeExecutionContext
   public Long extractThrottleTime() {
     long totalThrottleMsecs = 0L;
     for (MetricsContainerImpl container : containerRegistry.getContainers()) {
-      // TODO(https://github.com/apache/beam/issues/19632): Update throttling counters to use
-      // generic throttling-msecs metric.
+      CounterCell userThrottlingTime =
+          container.tryGetCounter(
+              MetricName.named(
+                  Metrics.THROTTLE_TIME_NAMESPACE, Metrics.THROTTLE_TIME_COUNTER_NAME));
+      if (userThrottlingTime != null) {
+        totalThrottleMsecs += userThrottlingTime.getCumulative();
+      }
+
       CounterCell dataStoreThrottlingTime =
           container.tryGetCounter(
-              MetricName.named(DATASTORE_THROTTLE_TIME_NAMESPACE, THROTTLE_TIME_COUNTER_NAME));
+              MetricName.named(
+                  DATASTORE_THROTTLE_TIME_NAMESPACE, Metrics.THROTTLE_TIME_COUNTER_NAME));
       if (dataStoreThrottlingTime != null) {
         totalThrottleMsecs += dataStoreThrottlingTime.getCumulative();
       }
@@ -546,7 +571,7 @@ public class BatchModeExecutionContext
       CounterCell httpClientApiThrottlingTime =
           container.tryGetCounter(
               MetricName.named(
-                  HTTP_CLIENT_API_THROTTLE_TIME_NAMESPACE, THROTTLE_TIME_COUNTER_NAME));
+                  HTTP_CLIENT_API_THROTTLE_TIME_NAMESPACE, Metrics.THROTTLE_TIME_COUNTER_NAME));
       if (httpClientApiThrottlingTime != null) {
         totalThrottleMsecs += httpClientApiThrottlingTime.getCumulative();
       }
@@ -554,14 +579,16 @@ public class BatchModeExecutionContext
       CounterCell bigqueryStreamingInsertThrottleTime =
           container.tryGetCounter(
               MetricName.named(
-                  BIGQUERY_STREAMING_INSERT_THROTTLE_TIME_NAMESPACE, THROTTLE_TIME_COUNTER_NAME));
+                  BIGQUERY_STREAMING_INSERT_THROTTLE_TIME_NAMESPACE,
+                  Metrics.THROTTLE_TIME_COUNTER_NAME));
       if (bigqueryStreamingInsertThrottleTime != null) {
         totalThrottleMsecs += bigqueryStreamingInsertThrottleTime.getCumulative();
       }
 
       CounterCell bigqueryReadThrottleTime =
           container.tryGetCounter(
-              MetricName.named(BIGQUERY_READ_THROTTLE_TIME_NAMESPACE, THROTTLE_TIME_COUNTER_NAME));
+              MetricName.named(
+                  BIGQUERY_READ_THROTTLE_TIME_NAMESPACE, Metrics.THROTTLE_TIME_COUNTER_NAME));
       if (bigqueryReadThrottleTime != null) {
         totalThrottleMsecs += bigqueryReadThrottleTime.getCumulative();
       }

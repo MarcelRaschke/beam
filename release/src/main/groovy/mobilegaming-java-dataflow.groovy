@@ -18,7 +18,6 @@
  */
 
 t = new TestScripts(args)
-mobileGamingCommands = new MobileGamingCommands(testScripts: t)
 
 /*
  * Run the mobile game examples on Dataflow.
@@ -36,6 +35,8 @@ String command_output_text
  *  Run the UserScore example on DataflowRunner
  * */
 
+mobileGamingCommands = new MobileGamingCommands(testScripts: t, testRunId: UUID.randomUUID().toString())
+
 t.intent("Running: UserScore example on DataflowRunner")
 t.run(mobileGamingCommands.createPipelineCommand("UserScore", runner))
 command_output_text = t.run "gsutil cat gs://${t.gcsBucket()}/${mobileGamingCommands.getUserScoreOutputName(runner)}* | grep user19_BananaWallaby"
@@ -47,6 +48,8 @@ t.run "gsutil rm gs://${t.gcsBucket()}/${mobileGamingCommands.getUserScoreOutput
 /**
  * Run the HourlyTeamScore example on DataflowRunner
  * */
+
+mobileGamingCommands = new MobileGamingCommands(testScripts: t, testRunId: UUID.randomUUID().toString())
 
 t.intent("Running: HourlyTeamScore example on DataflowRunner")
 t.run(mobileGamingCommands.createPipelineCommand("HourlyTeamScore", runner))
@@ -95,15 +98,20 @@ class LeaderBoardRunner {
     def isSuccess = false
     String query_result = ""
     while ((System.currentTimeMillis() - startTime) / 60000 < mobileGamingCommands.EXECUTION_TIMEOUT_IN_MINUTES) {
-      tables = t.run "bq query SELECT table_id FROM ${t.bqDataset()}.__TABLES_SUMMARY__"
-      if (tables.contains("leaderboard_${runner}_user") && tables.contains("leaderboard_${runner}_team")) {
-        query_result = t.run """bq query --batch "SELECT user FROM [${t.gcpProject()}:${
-          t.bqDataset()
-        }.leaderboard_${runner}_user] LIMIT 10\""""
-        if (t.seeAnyOf(mobileGamingCommands.COLORS, query_result)) {
-          isSuccess = true
-          break
+      try {
+        tables = t.run "bq query --use_legacy_sql=false SELECT table_name FROM ${t.bqDataset()}.INFORMATION_SCHEMA.TABLES"
+        if (tables.contains("leaderboard_${runner}_user") && tables.contains("leaderboard_${runner}_team")) {
+          query_result = t.run """bq query --batch "SELECT user FROM [${t.gcpProject()}:${
+            t.bqDataset()
+          }.leaderboard_${runner}_user] LIMIT 10\""""
+          if (t.seeAnyOf(mobileGamingCommands.COLORS, query_result)) {
+            isSuccess = true
+            break
+          }
         }
+      } catch (Exception e) {
+        println "Warning: Exception while checking tables: ${e.message}"
+        println "Retrying..."
       }
       println "Waiting for pipeline to produce more results..."
       sleep(60000) // wait for 1 min

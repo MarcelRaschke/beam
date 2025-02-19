@@ -19,6 +19,7 @@ package org.apache.beam.runners.flink;
 
 import org.apache.beam.sdk.options.ApplicationNameOptions;
 import org.apache.beam.sdk.options.Default;
+import org.apache.beam.sdk.options.DefaultValueFactory;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.FileStagingOptions;
 import org.apache.beam.sdk.options.PipelineOptions;
@@ -32,7 +33,11 @@ import org.apache.beam.sdk.options.StreamingOptions;
  * requiring flink on the classpath (e.g. to use with the direct runner).
  */
 public interface FlinkPipelineOptions
-    extends PipelineOptions, ApplicationNameOptions, StreamingOptions, FileStagingOptions {
+    extends PipelineOptions,
+        ApplicationNameOptions,
+        StreamingOptions,
+        FileStagingOptions,
+        VersionDependentFlinkPipelineOptions {
 
   String AUTO = "[auto]";
   String PIPELINED = "PIPELINED";
@@ -121,6 +126,22 @@ public interface FlinkPipelineOptions
   boolean getFinishBundleBeforeCheckpointing();
 
   void setFinishBundleBeforeCheckpointing(boolean finishBundleBeforeCheckpointing);
+
+  @Description(
+      "If set, Unaligned checkpoints contain in-flight data (i.e., data stored in buffers) as part of the "
+          + "checkpoint state, allowing checkpoint barriers to overtake these buffers. Thus, the checkpoint duration "
+          + "becomes independent of the current throughput as checkpoint barriers are effectively not embedded into the "
+          + "stream of data anymore")
+  @Default.Boolean(false)
+  boolean getUnalignedCheckpointEnabled();
+
+  void setUnalignedCheckpointEnabled(boolean unalignedCheckpointEnabled);
+
+  @Description("Forces unaligned checkpoints, particularly allowing them for iterative jobs.")
+  @Default.Boolean(false)
+  boolean getForceUnalignedCheckpointEnabled();
+
+  void setForceUnalignedCheckpointEnabled(boolean forceUnalignedCheckpointEnabled);
 
   @Description(
       "Shuts down sources which have been idle for the configured time of milliseconds. Once a source has been "
@@ -224,17 +245,50 @@ public interface FlinkPipelineOptions
 
   void setRetainExternalizedCheckpointsOnCancellation(Boolean retainOnCancellation);
 
-  @Description("The maximum number of elements in a bundle.")
-  @Default.Long(1000)
+  @Description(
+      "The maximum number of elements in a bundle. Default values are 1000 for a streaming job and 1,000,000 for batch")
+  @Default.InstanceFactory(MaxBundleSizeFactory.class)
   Long getMaxBundleSize();
 
   void setMaxBundleSize(Long size);
 
-  @Description("The maximum time to wait before finalising a bundle (in milliseconds).")
-  @Default.Long(1000)
+  /**
+   * Maximum bundle size factory. For a streaming job it's desireable to keep bundle size small to
+   * optimize latency. In batch, we optimize for throughput and hence bundle size is kept large.
+   */
+  class MaxBundleSizeFactory implements DefaultValueFactory<Long> {
+    @Override
+    public Long create(PipelineOptions options) {
+      if (options.as(StreamingOptions.class).isStreaming()) {
+        return 1000L;
+      } else {
+        return 5000L;
+      }
+    }
+  }
+
+  @Description(
+      "The maximum time to wait before finalising a bundle (in milliseconds). Default values are 1000 for streaming and 10,000 for batch.")
+  @Default.InstanceFactory(MaxBundleTimeFactory.class)
   Long getMaxBundleTimeMills();
 
   void setMaxBundleTimeMills(Long time);
+
+  /**
+   * Maximum bundle time factory. For a streaming job it's desireable to keep the value small to
+   * optimize latency. In batch, we optimize for throughput and hence bundle time size is kept
+   * larger.
+   */
+  class MaxBundleTimeFactory implements DefaultValueFactory<Long> {
+    @Override
+    public Long create(PipelineOptions options) {
+      if (options.as(StreamingOptions.class).isStreaming()) {
+        return 1000L;
+      } else {
+        return 10000L;
+      }
+    }
+  }
 
   @Description(
       "Interval in milliseconds for sending latency tracking marks from the sources to the sinks. "
@@ -312,6 +366,28 @@ public interface FlinkPipelineOptions
   String getFlinkConfDir();
 
   void setFlinkConfDir(String confDir);
+
+  @Description(
+      "Set the maximum size of input split when data is read from a filesystem. 0 implies no max size.")
+  @Default.Long(0)
+  Long getFileInputSplitMaxSizeMB();
+
+  void setFileInputSplitMaxSizeMB(Long fileInputSplitMaxSizeMB);
+
+  @Description(
+      "Allow drain operation for flink pipelines that contain RequiresStableInput operator. Note that at time of draining,"
+          + "the RequiresStableInput contract might be violated if there any processing related failures in the DoFn operator.")
+  @Default.Boolean(false)
+  Boolean getEnableStableInputDrain();
+
+  void setEnableStableInputDrain(Boolean enableStableInputDrain);
+
+  @Description(
+      "Set a slot sharing group for all bounded sources. This is required when using Datastream to have the same scheduling behaviour as the Dataset API.")
+  @Default.Boolean(true)
+  Boolean getForceSlotSharingGroup();
+
+  void setForceSlotSharingGroup(Boolean enableStableInputDrain);
 
   static FlinkPipelineOptions defaults() {
     return PipelineOptionsFactory.as(FlinkPipelineOptions.class);

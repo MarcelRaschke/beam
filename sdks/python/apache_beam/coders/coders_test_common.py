@@ -53,7 +53,7 @@ try:
 except ImportError:
   dataclasses = None  # type: ignore
 
-MyNamedTuple = collections.namedtuple('A', ['x', 'y'])
+MyNamedTuple = collections.namedtuple('A', ['x', 'y'])  # type: ignore[name-match]
 MyTypedNamedTuple = NamedTuple('MyTypedNamedTuple', [('f1', int), ('f2', str)])
 
 
@@ -164,6 +164,7 @@ class CodersTest(unittest.TestCase):
         coders.SinglePrecisionFloatCoder,
         coders.ToBytesCoder,
         coders.BigIntegerCoder, # tested in DecimalCoder
+        coders.TimestampPrefixingOpaqueWindowCoder,
     ])
     cls.seen_nested -= set(
         [coders.ProtoCoder, coders.ProtoPlusCoder, CustomCoder])
@@ -739,6 +740,15 @@ class CodersTest(unittest.TestCase):
                 coders.IntervalWindowCoder()), )),
         (window.IntervalWindow(0, 10), ))
 
+  def test_timestamp_prefixing_opaque_window_coder(self):
+    sdk_coder = coders.TimestampPrefixingWindowCoder(
+        coders.LengthPrefixCoder(coders.PickleCoder()))
+    safe_coder = coders.TimestampPrefixingOpaqueWindowCoder()
+    for w in [window.IntervalWindow(1, 123), window.GlobalWindow()]:
+      round_trip = sdk_coder.decode(
+          safe_coder.encode(safe_coder.decode(sdk_coder.encode(w))))
+      self.assertEqual(w, round_trip)
+
   def test_decimal_coder(self):
     test_coder = coders.DecimalCoder()
 
@@ -758,6 +768,14 @@ class CodersTest(unittest.TestCase):
       self.assertEqual(
           test_encodings[idx],
           base64.b64encode(test_coder.encode(value)).decode().rstrip("="))
+
+  def test_OrderedUnionCoder(self):
+    test_coder = coders._OrderedUnionCoder((str, coders.StrUtf8Coder()),
+                                           (int, coders.VarIntCoder()),
+                                           fallback_coder=coders.FloatCoder())
+    self.check_coder(test_coder, 's')
+    self.check_coder(test_coder, 123)
+    self.check_coder(test_coder, 1.5)
 
 
 if __name__ == '__main__':

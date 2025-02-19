@@ -17,7 +17,7 @@
  */
 package org.apache.beam.fn.harness.state;
 
-import static org.apache.beam.runners.core.construction.ModelCoders.STATE_BACKED_ITERABLE_CODER_URN;
+import static org.apache.beam.sdk.util.construction.ModelCoders.STATE_BACKED_ITERABLE_CODER_URN;
 
 import com.google.auto.service.AutoService;
 import java.io.DataOutputStream;
@@ -30,25 +30,31 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
 import org.apache.beam.fn.harness.Cache;
 import org.apache.beam.fn.harness.Caches;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.StateKey;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.StateRequest;
-import org.apache.beam.runners.core.construction.CoderTranslation.TranslationContext;
-import org.apache.beam.runners.core.construction.CoderTranslator;
-import org.apache.beam.runners.core.construction.CoderTranslatorRegistrar;
 import org.apache.beam.sdk.coders.IterableLikeCoder;
 import org.apache.beam.sdk.fn.stream.PrefetchableIterable;
 import org.apache.beam.sdk.fn.stream.PrefetchableIterators;
 import org.apache.beam.sdk.util.BufferedElementCountingOutputStream;
 import org.apache.beam.sdk.util.VarInt;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.ByteString;
+import org.apache.beam.sdk.util.common.ElementByteSizeObservableIterable;
+import org.apache.beam.sdk.util.common.ElementByteSizeObservableIterator;
+import org.apache.beam.sdk.util.common.ElementByteSizeObserver;
+import org.apache.beam.sdk.util.construction.CoderTranslation.TranslationContext;
+import org.apache.beam.sdk.util.construction.CoderTranslator;
+import org.apache.beam.sdk.util.construction.CoderTranslatorRegistrar;
+import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.io.ByteStreams;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A {@link BeamFnStateClient state} backed iterable which allows for fetching elements over the
@@ -62,11 +68,16 @@ import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.io.ByteStreams
 @SuppressWarnings({
   "rawtypes" // TODO(https://github.com/apache/beam/issues/20447)
 })
-public class StateBackedIterable<T> implements Iterable<T>, Serializable {
+public class StateBackedIterable<T>
+    extends ElementByteSizeObservableIterable<T, ElementByteSizeObservableIterator<T>>
+    implements Serializable {
+  private static final Logger LOG = LoggerFactory.getLogger(StateBackedIterable.class);
 
   @VisibleForTesting final StateRequest request;
   @VisibleForTesting final List<T> prefix;
   private final transient PrefetchableIterable<T> suffix;
+
+  private final org.apache.beam.sdk.coders.Coder<T> elemCoder;
 
   public StateBackedIterable(
       Cache<?, ?> cache,
@@ -81,11 +92,104 @@ public class StateBackedIterable<T> implements Iterable<T>, Serializable {
     this.suffix =
         StateFetchingIterators.readAllAndDecodeStartingFrom(
             Caches.subCache(cache, stateKey), beamFnStateClient, request, elemCoder);
+    this.elemCoder = elemCoder;
+  }
+
+  @SuppressWarnings("nullness")
+  private static class WrappedObservingIterator<T> extends ElementByteSizeObservableIterator<T> {
+    private final Iterator<T> wrappedIterator;
+    private final org.apache.beam.sdk.coders.Coder<T> elementCoder;
+
+    // Logically final and non-null but initialized after construction by factory method for
+    // initialization ordering.
+    private ElementByteSizeObserver observerProxy = null;
+
+    private boolean observerNeedsAdvance = false;
+    private boolean exceptionLogged = false;
+
+    // Lowest sampling probability: 0.001%.
+    private static final int SAMPLING_TOKEN_UPPER_BOUND = 1000000;
+    private static final int SAMPLING_CUTOFF = 10;
+    private int samplingToken = 0;
+
+    static <T> WrappedObservingIterator<T> create(
+        Iterator<T> iterator, org.apache.beam.sdk.coders.Coder<T> elementCoder) {
+      WrappedObservingIterator<T> result = new WrappedObservingIterator<>(iterator, elementCoder);
+      result.observerProxy =
+          new ElementByteSizeObserver() {
+            @Override
+            protected void reportElementSize(long elementByteSize) {
+              result.notifyValueReturned(elementByteSize);
+            }
+          };
+      return result;
+    }
+
+    private WrappedObservingIterator(
+        Iterator<T> iterator, org.apache.beam.sdk.coders.Coder<T> elementCoder) {
+      this.wrappedIterator = iterator;
+      this.elementCoder = elementCoder;
+    }
+
+    private boolean sampleElement() {
+      // Sampling probability decreases as the element count is increasing.
+      // We unconditionally sample the first samplingCutoff elements. For the
+      // next samplingCutoff elements, the sampling probability drops from 100%
+      // to 50%. The probability of sampling the Nth element is:
+      // min(1, samplingCutoff / N), with an additional lower bound of
+      // samplingCutoff / samplingTokenUpperBound. This algorithm may be refined
+      // later.
+      samplingToken = Math.min(samplingToken + 1, SAMPLING_TOKEN_UPPER_BOUND);
+      return ThreadLocalRandom.current().nextInt(samplingToken) < SAMPLING_CUTOFF;
+    }
+
+    @Override
+    public boolean hasNext() {
+      if (observerNeedsAdvance) {
+        observerProxy.advance();
+        observerNeedsAdvance = false;
+      }
+      return wrappedIterator.hasNext();
+    }
+
+    @Override
+    public T next() {
+      T value = wrappedIterator.next();
+      try {
+        boolean cheap = elementCoder.isRegisterByteSizeObserverCheap(value);
+        if (cheap || sampleElement()) {
+          observerProxy.setScalingFactor(
+              cheap ? 1.0 : Math.max(samplingToken, SAMPLING_CUTOFF) / (double) SAMPLING_CUTOFF);
+          elementCoder.registerByteSizeObserver(value, observerProxy);
+          if (observerProxy.getIsLazy()) {
+            // The observer will only be notified of bytes as the result
+            // is used. We defer advancing the observer until hasNext in an
+            // attempt to capture those bytes.
+            observerNeedsAdvance = true;
+          } else {
+            observerNeedsAdvance = false;
+            observerProxy.advance();
+          }
+        }
+      } catch (Exception e) {
+        if (!exceptionLogged) {
+          LOG.warn("Lazily observed byte size will be under reported due to exception", e);
+          exceptionLogged = true;
+        }
+      }
+      return value;
+    }
+
+    @Override
+    public void remove() {
+      super.remove();
+    }
   }
 
   @Override
-  public Iterator<T> iterator() {
-    return PrefetchableIterators.concat(prefix.iterator(), suffix.iterator());
+  protected ElementByteSizeObservableIterator<T> createIterator() {
+    return WrappedObservingIterator.create(
+        PrefetchableIterators.concat(prefix.iterator(), suffix.iterator()), elemCoder);
   }
 
   protected Object writeReplace() throws ObjectStreamException {

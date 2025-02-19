@@ -60,6 +60,12 @@ task validatesContainerTests {
   }
 }
 
+task validatesDistrolessContainerTests {
+  getVersionsAsList('python_versions').each {
+    dependsOn.add(":sdks:python:test-suites:dataflow:py${getVersionSuffix(it)}:validatesDistrolessContainer")
+  }
+}
+
 task examplesPostCommit {
   getVersionsAsList('dataflow_examples_postcommit_py_versions').each {
     dependsOn.add(":sdks:python:test-suites:dataflow:py${getVersionSuffix(it)}:examples")
@@ -67,13 +73,13 @@ task examplesPostCommit {
 }
 
 task gcpCrossLanguagePostCommit {
-  getVersionsAsList('cross_language_validates_gcp_py_versions').each {
+  getVersionsAsList('cross_language_validates_py_versions').each {
     dependsOn.add(":sdks:python:test-suites:dataflow:py${getVersionSuffix(it)}:gcpCrossLanguagePythonUsingJava")
   }
 }
 
 task ioCrossLanguagePostCommit {
-  getVersionsAsList('cross_language_validates_gcp_py_versions').each {
+  getVersionsAsList('cross_language_validates_py_versions').each {
     dependsOn.add(":sdks:python:test-suites:dataflow:py${getVersionSuffix(it)}:ioCrossLanguagePythonUsingJava")
   }
 }

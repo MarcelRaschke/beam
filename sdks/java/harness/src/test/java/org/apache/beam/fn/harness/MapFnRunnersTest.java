@@ -31,13 +31,13 @@ import java.util.List;
 import org.apache.beam.fn.harness.MapFnRunners.ValueMapFnFactory;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.PTransform;
-import org.apache.beam.runners.core.construction.CoderTranslation;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.function.ThrowingFunction;
 import org.apache.beam.sdk.transforms.windowing.GlobalWindow;
 import org.apache.beam.sdk.transforms.windowing.IntervalWindow;
 import org.apache.beam.sdk.transforms.windowing.PaneInfo;
 import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.CoderTranslation;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableSet;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
@@ -71,8 +71,11 @@ public class MapFnRunnersTest {
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(EXPECTED_ID, EXPECTED_PTRANSFORM)
             .processBundleInstructionId("57")
-            .pCollections(Collections.singletonMap("inputPC", INPUT_PCOLLECTION))
-            .coders(Collections.singletonMap("coder-id", valueCoder))
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(Collections.singletonMap("inputPC", INPUT_PCOLLECTION))
+                    .putAllCoders(Collections.singletonMap("coder-id", valueCoder))
+                    .build())
             .build();
     List<WindowedValue<?>> outputConsumer = new ArrayList<>();
     context.addPCollectionConsumer("outputPC", outputConsumer::add);
@@ -97,8 +100,11 @@ public class MapFnRunnersTest {
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(EXPECTED_ID, EXPECTED_PTRANSFORM)
             .processBundleInstructionId("57")
-            .pCollections(Collections.singletonMap("inputPC", INPUT_PCOLLECTION))
-            .coders(Collections.singletonMap("coder-id", valueCoder))
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(Collections.singletonMap("inputPC", INPUT_PCOLLECTION))
+                    .putAllCoders(Collections.singletonMap("coder-id", valueCoder))
+                    .build())
             .build();
     List<WindowedValue<?>> outputConsumer = new ArrayList<>();
     context.addPCollectionConsumer("outputPC", outputConsumer::add);
@@ -122,8 +128,11 @@ public class MapFnRunnersTest {
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(EXPECTED_ID, EXPECTED_PTRANSFORM)
             .processBundleInstructionId("57")
-            .pCollections(Collections.singletonMap("inputPC", INPUT_PCOLLECTION))
-            .coders(Collections.singletonMap("coder-id", valueCoder))
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(Collections.singletonMap("inputPC", INPUT_PCOLLECTION))
+                    .putAllCoders(Collections.singletonMap("coder-id", valueCoder))
+                    .build())
             .build();
     List<WindowedValue<?>> outputConsumer = new ArrayList<>();
     context.addPCollectionConsumer("outputPC", outputConsumer::add);

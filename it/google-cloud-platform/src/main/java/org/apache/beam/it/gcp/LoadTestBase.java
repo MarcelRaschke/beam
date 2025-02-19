@@ -18,6 +18,7 @@
 package org.apache.beam.it.gcp;
 
 import static org.apache.beam.it.common.logging.LogStrings.formatForLogging;
+import static org.apache.beam.it.gcp.dataflow.AbstractPipelineLauncher.RUNNER_V2;
 
 import com.google.api.gax.core.CredentialsProvider;
 import com.google.api.gax.core.FixedCredentialsProvider;
@@ -39,7 +40,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.regex.Pattern;
-import javax.annotation.Nullable;
 import org.apache.beam.it.common.PipelineLauncher;
 import org.apache.beam.it.common.PipelineLauncher.LaunchInfo;
 import org.apache.beam.it.common.PipelineOperator;
@@ -47,8 +47,10 @@ import org.apache.beam.it.common.TestProperties;
 import org.apache.beam.it.gcp.bigquery.BigQueryResourceManager;
 import org.apache.beam.it.gcp.monitoring.MonitoringClient;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects;
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.rules.TestRule;
 import org.junit.rules.TestWatcher;
@@ -107,11 +109,14 @@ public abstract class LoadTestBase {
         }
       };
 
-  @Before
-  @SuppressFBWarnings("ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD")
-  public void setUp() throws IOException {
+  @BeforeClass
+  public static void setUpClass() {
     project = TestProperties.project();
     region = TestProperties.region();
+  }
+
+  @Before
+  public void setUp() throws IOException {
     monitoringClient = MonitoringClient.builder(CREDENTIALS_PROVIDER).build();
     pipelineLauncher = launcher();
     pipelineOperator = new PipelineOperator(pipelineLauncher);
@@ -123,7 +128,7 @@ public abstract class LoadTestBase {
     monitoringClient.cleanupAll();
   }
 
-  abstract PipelineLauncher launcher() throws IOException;
+  public abstract PipelineLauncher launcher();
 
   /**
    * Exports the metrics of given dataflow job to BigQuery.
@@ -131,8 +136,7 @@ public abstract class LoadTestBase {
    * @param launchInfo Job info of the job
    * @param metrics metrics to export
    */
-  protected void exportMetricsToBigQuery(LaunchInfo launchInfo, Map<String, Double> metrics)
-      throws IOException {
+  protected void exportMetricsToBigQuery(LaunchInfo launchInfo, Map<String, Double> metrics) {
     LOG.info("Exporting metrics:\n{}", formatForLogging(metrics));
     try {
       // either use the user specified project for exporting, or the same project
@@ -140,7 +144,6 @@ public abstract class LoadTestBase {
       BigQueryResourceManager bigQueryResourceManager =
           BigQueryResourceManager.builder(testName, exportProject, CREDENTIALS)
               .setDatasetId(TestProperties.exportDataset())
-              .setCredentials(CREDENTIALS)
               .build();
       // exporting metrics to bigQuery table
       Map<String, Object> rowContent = new HashMap<>();
@@ -169,8 +172,12 @@ public abstract class LoadTestBase {
       rowContent.put("metrics", metricRows);
       bigQueryResourceManager.write(
           TestProperties.exportTable(), RowToInsert.of("rowId", rowContent));
-    } catch (IllegalStateException e) {
-      LOG.error("Unable to export results to datastore. ", e);
+    } catch (IllegalStateException | IllegalArgumentException e) {
+      LOG.error(
+          "Unable to export results to datastore."
+              + "The next System properties might be missing or incorrect: "
+              + "'exportDataset', 'exportTable', 'exportProject' (Optional).",
+          e);
     }
   }
 
@@ -212,19 +219,23 @@ public abstract class LoadTestBase {
     // cost info
     LOG.info("Calculating approximate cost for {} under {}", launchInfo.jobId(), project);
     TimeInterval workerTimeInterval = getWorkerTimeInterval(launchInfo);
-    metrics.put(
-        "RunTime",
-        (double)
-            Timestamps.between(workerTimeInterval.getStartTime(), workerTimeInterval.getEndTime())
-                .getSeconds());
+    if (workerTimeInterval.hasStartTime() && workerTimeInterval.hasEndTime()) {
+      metrics.put(
+          "RunTime",
+          (double)
+              Timestamps.between(workerTimeInterval.getStartTime(), workerTimeInterval.getEndTime())
+                  .getSeconds());
+    }
     double cost = 0;
     if (launchInfo.jobType().equals("JOB_TYPE_STREAMING")) {
       cost += metrics.get("TotalVcpuTime") / 3600 * VCPU_PER_HR_STREAMING;
       cost += (metrics.get("TotalMemoryUsage") / 1000) / 3600 * MEM_PER_GB_HR_STREAMING;
       cost += metrics.get("TotalStreamingDataProcessed") * SHUFFLE_PER_GB_STREAMING;
       // Also, add other streaming metrics
-      metrics.putAll(getDataFreshnessMetrics(launchInfo.jobId(), workerTimeInterval));
-      metrics.putAll(getSystemLatencyMetrics(launchInfo.jobId(), workerTimeInterval));
+      if (workerTimeInterval.hasEndTime() && workerTimeInterval.hasStartTime()) {
+        metrics.putAll(getDataFreshnessMetrics(launchInfo.jobId(), workerTimeInterval));
+        metrics.putAll(getSystemLatencyMetrics(launchInfo.jobId(), workerTimeInterval));
+      }
     } else {
       cost += metrics.get("TotalVcpuTime") / 3600 * VCPU_PER_HR_BATCH;
       cost += (metrics.get("TotalMemoryUsage") / 1000) / 3600 * MEM_PER_GB_HR_BATCH;
@@ -240,8 +251,10 @@ public abstract class LoadTestBase {
     if (dataProcessed != null) {
       metrics.put("EstimatedDataProcessedGB", dataProcessed / 1e9d);
     }
-    metrics.putAll(getCpuUtilizationMetrics(launchInfo.jobId(), workerTimeInterval));
-    metrics.putAll(getThroughputMetrics(launchInfo.jobId(), config, workerTimeInterval));
+    if (workerTimeInterval.hasEndTime() && workerTimeInterval.hasStartTime()) {
+      metrics.putAll(getCpuUtilizationMetrics(launchInfo.jobId(), workerTimeInterval));
+      metrics.putAll(getThroughputMetrics(launchInfo, config, workerTimeInterval));
+    }
   }
 
   /**
@@ -351,25 +364,30 @@ public abstract class LoadTestBase {
   /**
    * Computes throughput metrics of the given pcollection in dataflow job.
    *
-   * @param jobId dataflow job id
+   * @param jobInfo dataflow job LaunchInfo
    * @param config the {@class MetricsConfiguration}
    * @param timeInterval interval for the monitoring query
    * @return throughput metrics of the pcollection
    */
   protected Map<String, Double> getThroughputMetrics(
-      String jobId, MetricsConfiguration config, TimeInterval timeInterval) {
+      LaunchInfo jobInfo, MetricsConfiguration config, TimeInterval timeInterval) {
+    String jobId = jobInfo.jobId();
+    String iColl =
+        RUNNER_V2.equals(jobInfo.runner())
+            ? config.inputPCollectionV2()
+            : config.inputPCollection();
+    String oColl =
+        RUNNER_V2.equals(jobInfo.runner())
+            ? config.outputPCollectionV2()
+            : config.outputPCollection();
     List<Double> inputThroughputBytesPerSec =
-        monitoringClient.getThroughputBytesPerSecond(
-            project, jobId, config.inputPCollection(), timeInterval);
+        monitoringClient.getThroughputBytesPerSecond(project, jobId, iColl, timeInterval);
     List<Double> inputThroughputElementsPerSec =
-        monitoringClient.getThroughputElementsPerSecond(
-            project, jobId, config.inputPCollection(), timeInterval);
+        monitoringClient.getThroughputElementsPerSecond(project, jobId, iColl, timeInterval);
     List<Double> outputThroughputBytesPerSec =
-        monitoringClient.getThroughputBytesPerSecond(
-            project, jobId, config.outputPCollection(), timeInterval);
+        monitoringClient.getThroughputBytesPerSecond(project, jobId, oColl, timeInterval);
     List<Double> outputThroughputElementsPerSec =
-        monitoringClient.getThroughputElementsPerSecond(
-            project, jobId, config.outputPCollection(), timeInterval);
+        monitoringClient.getThroughputElementsPerSecond(project, jobId, oColl, timeInterval);
     return getThroughputMetrics(
         inputThroughputBytesPerSec,
         inputThroughputElementsPerSec,
@@ -497,11 +515,16 @@ public abstract class LoadTestBase {
      */
     public abstract @Nullable String inputPCollection();
 
+    /** Input PCollection name under Dataflow runner v2. */
+    public abstract @Nullable String inputPCollectionV2();
+
     /**
      * Input PCollection of the Dataflow job to query additional metrics. If not provided, the
      * metrics for inputPCollection will not be calculated.
      */
     public abstract @Nullable String outputPCollection();
+
+    public abstract @Nullable String outputPCollectionV2();
 
     public static Builder builder() {
       return new AutoValue_LoadTestBase_MetricsConfiguration.Builder();
@@ -512,7 +535,11 @@ public abstract class LoadTestBase {
 
       public abstract Builder setInputPCollection(@Nullable String value);
 
+      public abstract Builder setInputPCollectionV2(@Nullable String value);
+
       public abstract Builder setOutputPCollection(@Nullable String value);
+
+      public abstract Builder setOutputPCollectionV2(@Nullable String value);
 
       public abstract MetricsConfiguration build();
     }

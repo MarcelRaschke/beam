@@ -385,7 +385,7 @@ class ByteBuddyDoFnInvokerFactory implements DoFnInvokerFactory {
   public static class DefaultNewWatermarkEstimator {
 
     /**
-     * Constructs a new watermark estimator from the state type if it is annotated wtih {@link
+     * Constructs a new watermark estimator from the state type if it is annotated with {@link
      * HasDefaultWatermarkEstimator} otherwise returns a watermark estimator that always reports the
      * minimum watermark.
      */
@@ -1309,12 +1309,7 @@ class ByteBuddyDoFnInvokerFactory implements DoFnInvokerFactory {
       if (returnVarIndex != null) {
         // Drop the return type from the locals
         mv.visitLocalVariable(
-            "res",
-            returnType.getDescriptor(),
-            returnType.getGenericSignature(),
-            wrapStart,
-            wrapEnd,
-            returnVarIndex);
+            "res", returnType.getDescriptor(), null, wrapStart, wrapEnd, returnVarIndex);
       }
 
       return size;

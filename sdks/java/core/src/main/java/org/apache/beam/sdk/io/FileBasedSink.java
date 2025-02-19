@@ -113,7 +113,7 @@ import org.slf4j.LoggerFactory;
  * <p>{@link FileBasedSink} can take a custom {@link FilenamePolicy} object to determine output
  * filenames, and this policy object can be used to write windowed or triggered PCollections into
  * separate files per window pane. This allows file output from unbounded PCollections, and also
- * works for bounded PCollecctions.
+ * works for bounded PCollections.
  *
  * <p>Supported file systems are those registered with {@link FileSystems}.
  *
@@ -688,7 +688,22 @@ public abstract class FileBasedSink<UserT, DestinationT, OutputT>
         distinctFilenames.put(finalFilename, result);
         outputFilenames.add(KV.of(result, finalFilename));
       }
+      reportSinkLineage(outputFilenames);
       return outputFilenames;
+    }
+
+    /**
+     * Report sink Lineage. Report every file if number of files no more than 100, otherwise only
+     * report at directory level.
+     */
+    private void reportSinkLineage(List<KV<FileResult<DestinationT>, ResourceId>> outputFilenames) {
+      if (outputFilenames.size() <= 100) {
+        for (KV<FileResult<DestinationT>, ResourceId> kv : outputFilenames) {
+          FileSystems.reportSinkLineage(kv.getValue());
+        }
+      } else {
+        FileSystems.reportSinkLineage(outputFilenames.get(0).getValue().getCurrentDirectory());
+      }
     }
 
     private Collection<FileResult<DestinationT>> createMissingEmptyShards(

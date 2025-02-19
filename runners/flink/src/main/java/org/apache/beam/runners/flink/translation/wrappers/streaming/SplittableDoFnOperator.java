@@ -49,6 +49,7 @@ import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.WindowingStrategy;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.joda.time.Duration;
@@ -64,7 +65,10 @@ import org.slf4j.LoggerFactory;
   "nullness" // TODO(https://github.com/apache/beam/issues/20497)
 })
 public class SplittableDoFnOperator<InputT, OutputT, RestrictionT>
-    extends DoFnOperator<KeyedWorkItem<byte[], KV<InputT, RestrictionT>>, OutputT> {
+    extends DoFnOperator<
+        KeyedWorkItem<byte[], KV<InputT, RestrictionT>>,
+        KeyedWorkItem<byte[], KV<InputT, RestrictionT>>,
+        OutputT> {
 
   private static final Logger LOG = LoggerFactory.getLogger(SplittableDoFnOperator.class);
 
@@ -126,7 +130,11 @@ public class SplittableDoFnOperator<InputT, OutputT, RestrictionT>
     // this will implicitly be keyed like the StateInternalsFactory
     TimerInternalsFactory<byte[]> timerInternalsFactory = key -> timerInternals;
 
-    executorService = Executors.newSingleThreadScheduledExecutor(Executors.defaultThreadFactory());
+    if (this.executorService == null) {
+      this.executorService =
+          Executors.newSingleThreadScheduledExecutor(
+              new ThreadFactoryBuilder().setNameFormat("flink-sdf-executor-%d").build());
+    }
 
     ((ProcessFn) doFn).setStateInternalsFactory(stateInternalsFactory);
     ((ProcessFn) doFn).setTimerInternalsFactory(timerInternalsFactory);
@@ -191,10 +199,12 @@ public class SplittableDoFnOperator<InputT, OutputT, RestrictionT>
             "The scheduled executor service did not properly terminate. Shutting "
                 + "it down now.");
         executorService.shutdownNow();
+        executorService = null;
       }
     } catch (InterruptedException e) {
       LOG.debug("Could not properly await the termination of the scheduled executor service.", e);
       executorService.shutdownNow();
+      executorService = null;
     }
   }
 }

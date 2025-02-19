@@ -20,6 +20,7 @@ package org.apache.beam.sdk.io.gcp.bigquery;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 
+import com.google.api.services.bigquery.model.Clustering;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.api.services.bigquery.model.TableSchema;
@@ -48,10 +49,15 @@ public class StorageApiSinkRowUpdateIT {
   private static final String BIG_QUERY_DATASET_ID =
       "storage_api_sink_rows_update" + System.nanoTime();
 
+  // used when test suite specifies a particular GCP location for BigQuery operations
+  private static String bigQueryLocation;
+
   @BeforeClass
   public static void setUpTestEnvironment() throws IOException, InterruptedException {
     // Create one BQ dataset for all test cases.
-    BQ_CLIENT.createNewDataset(PROJECT, BIG_QUERY_DATASET_ID);
+    bigQueryLocation =
+        TestPipeline.testingPipelineOptions().as(TestBigQueryOptions.class).getBigQueryLocation();
+    BQ_CLIENT.createNewDataset(PROJECT, BIG_QUERY_DATASET_ID, null, bigQueryLocation);
   }
 
   @AfterClass
@@ -59,42 +65,12 @@ public class StorageApiSinkRowUpdateIT {
     BQ_CLIENT.deleteDataset(PROJECT, BIG_QUERY_DATASET_ID);
   }
 
-  private static String createTable(TableSchema tableSchema, List<String> primaryKey)
-      throws IOException, InterruptedException {
-    String table = "table" + System.nanoTime();
-
-    BQ_CLIENT.deleteTable(PROJECT, BIG_QUERY_DATASET_ID, table);
-
-    StringBuilder ddl =
-        new StringBuilder("CREATE TABLE ")
-            .append(PROJECT)
-            .append(".")
-            .append(BIG_QUERY_DATASET_ID)
-            .append(".")
-            .append(table)
-            .append("(");
-    for (TableFieldSchema tableFieldSchema : tableSchema.getFields()) {
-      ddl.append(tableFieldSchema.getName())
-          .append(" ")
-          .append(tableFieldSchema.getType())
-          .append(",");
-    }
-
-    String primaryKeyString = String.join(",", primaryKey);
-    ddl.append(" PRIMARY KEY ")
-        .append("(")
-        .append(primaryKeyString)
-        .append(")")
-        .append(" NOT ENFORCED) ");
-    ddl.append("CLUSTER BY ").append(primaryKeyString);
-
-    BQ_CLIENT.queryWithRetriesUsingStandardSql(ddl.toString(), PROJECT);
-
-    return PROJECT + "." + BIG_QUERY_DATASET_ID + "." + table;
+  private static String getTablespec() {
+    return PROJECT + "." + BIG_QUERY_DATASET_ID + "." + "table" + System.nanoTime();
   }
 
   @Test
-  public void testCdc() throws Exception {
+  public void testCdcUsingLongSeqNum() throws Exception {
     TableSchema tableSchema =
         new TableSchema()
             .setFields(
@@ -130,7 +106,8 @@ public class StorageApiSinkRowUpdateIT {
                 new TableRow().set("key1", "foo4").set("key2", "bar4").set("value", "1"),
                 RowMutationInformation.of(RowMutationInformation.MutationType.DELETE, 1)));
 
-    String tableSpec = createTable(tableSchema, Lists.newArrayList("key1", "key2"));
+    List<String> primaryKey = Lists.newArrayList("key1", "key2");
+    String tableSpec = getTablespec();
     Pipeline p = Pipeline.create();
     p.apply("Create rows", Create.of(items))
         .apply(
@@ -138,8 +115,71 @@ public class StorageApiSinkRowUpdateIT {
             BigQueryIO.applyRowMutations()
                 .to(tableSpec)
                 .withSchema(tableSchema)
+                .withPrimaryKey(primaryKey)
+                .withClustering(new Clustering().setFields(primaryKey))
                 .withMethod(BigQueryIO.Write.Method.STORAGE_API_AT_LEAST_ONCE)
-                .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_NEVER));
+                .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED));
+
+    p.run();
+
+    List<TableRow> expected =
+        Lists.newArrayList(
+            new TableRow().set("key1", "foo0").set("key2", "bar0").set("value", "2"),
+            new TableRow().set("key1", "foo1").set("key2", "bar1").set("value", "3"),
+            new TableRow().set("key1", "foo3").set("key2", "bar3").set("value", "1"));
+    assertRowsWritten(tableSpec, expected);
+  }
+
+  @Test
+  public void testCdcUsingHexSequenceNum() throws Exception {
+    TableSchema tableSchema =
+        new TableSchema()
+            .setFields(
+                ImmutableList.of(
+                    new TableFieldSchema().setName("key1").setType("STRING"),
+                    new TableFieldSchema().setName("key2").setType("STRING"),
+                    new TableFieldSchema().setName("value").setType("STRING")));
+
+    List<RowMutation> items =
+        Lists.newArrayList(
+            RowMutation.of(
+                new TableRow().set("key1", "foo0").set("key2", "bar0").set("value", "1"),
+                RowMutationInformation.of(RowMutationInformation.MutationType.UPSERT, "AAA/0")),
+            RowMutation.of(
+                new TableRow().set("key1", "foo1").set("key2", "bar1").set("value", "1"),
+                RowMutationInformation.of(RowMutationInformation.MutationType.UPSERT, "AAA/0")),
+            RowMutation.of(
+                new TableRow().set("key1", "foo0").set("key2", "bar0").set("value", "2"),
+                RowMutationInformation.of(RowMutationInformation.MutationType.UPSERT, "AAA/1")),
+            RowMutation.of(
+                new TableRow().set("key1", "foo1").set("key2", "bar1").set("value", "1"),
+                RowMutationInformation.of(RowMutationInformation.MutationType.DELETE, "AAA/1")),
+            RowMutation.of(
+                new TableRow().set("key1", "foo3").set("key2", "bar3").set("value", "1"),
+                RowMutationInformation.of(RowMutationInformation.MutationType.UPSERT, "AAA/0")),
+            RowMutation.of(
+                new TableRow().set("key1", "foo1").set("key2", "bar1").set("value", "3"),
+                RowMutationInformation.of(RowMutationInformation.MutationType.UPSERT, "AAA/2")),
+            RowMutation.of(
+                new TableRow().set("key1", "foo4").set("key2", "bar4").set("value", "1"),
+                RowMutationInformation.of(RowMutationInformation.MutationType.UPSERT, "AAA/0")),
+            RowMutation.of(
+                new TableRow().set("key1", "foo4").set("key2", "bar4").set("value", "1"),
+                RowMutationInformation.of(RowMutationInformation.MutationType.DELETE, "AAA/1")));
+
+    List<String> primaryKey = Lists.newArrayList("key1", "key2");
+    String tableSpec = getTablespec();
+    Pipeline p = Pipeline.create();
+    p.apply("Create rows", Create.of(items))
+        .apply(
+            "Apply updates",
+            BigQueryIO.applyRowMutations()
+                .to(tableSpec)
+                .withSchema(tableSchema)
+                .withPrimaryKey(primaryKey)
+                .withClustering(new Clustering().setFields(primaryKey))
+                .withMethod(BigQueryIO.Write.Method.STORAGE_API_AT_LEAST_ONCE)
+                .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED));
 
     p.run();
 
@@ -155,7 +195,7 @@ public class StorageApiSinkRowUpdateIT {
       throws IOException, InterruptedException {
     List<TableRow> queryResponse =
         BQ_CLIENT.queryUnflattened(
-            String.format("SELECT * FROM %s", tableSpec), PROJECT, true, true);
+            String.format("SELECT * FROM %s", tableSpec), PROJECT, true, true, bigQueryLocation);
     assertThat(queryResponse, containsInAnyOrder(Iterables.toArray(expected, TableRow.class)));
   }
 }

@@ -18,8 +18,8 @@
 package org.apache.beam.runners.dataflow.worker.status;
 
 import static org.junit.Assert.assertEquals;
-import static org.mockito.Matchers.eq;
-import static org.mockito.Matchers.isA;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -31,7 +31,7 @@ import com.google.api.services.dataflow.model.GetDebugConfigResponse;
 import com.google.api.services.dataflow.model.SendDebugCaptureRequest;
 import com.google.api.services.dataflow.model.SendDebugCaptureResponse;
 import java.util.Collections;
-import org.apache.beam.runners.dataflow.worker.options.StreamingDataflowWorkerOptions;
+import org.apache.beam.runners.dataflow.options.DataflowWorkerHarnessOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.junit.Before;
 import org.junit.Test;
@@ -76,9 +76,9 @@ public class DebugCaptureTest {
     return mockDataflowClient;
   }
 
-  private StreamingDataflowWorkerOptions buildDataflowWorkerOptions() throws Exception {
-    StreamingDataflowWorkerOptions options =
-        PipelineOptionsFactory.as(StreamingDataflowWorkerOptions.class);
+  private DataflowWorkerHarnessOptions buildDataflowWorkerOptions() throws Exception {
+    DataflowWorkerHarnessOptions options =
+        PipelineOptionsFactory.as(DataflowWorkerHarnessOptions.class);
     options.setProject(PROJECT_ID);
     options.setRegion(REGION);
     options.setJobId(JOB_ID);

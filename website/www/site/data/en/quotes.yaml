@@ -11,6 +11,11 @@
 # limitations under the License.
 
 #Cards with quotes will be displayed by the order listed, e.g., first card will display the first quote
+- text: Apache Beam fuels LinkedIn's streaming infrastructure, processing 4 trillion events daily through 3K+ pipelines in near-real time. Beam enabled unified pipelines, yielding 2x cost savings and remarkable improvements for many use cases.
+  icon: icons/quote-icon.svg
+  logoUrl: images/logos/powered-by/linkedin.png
+  linkUrl: case-studies/linkedin/index.html
+  linkText: Learn more
 - text: With Apache Beam, OCTO accelerated the migration of one of France’s largest grocery retailers to streaming processing for transactional data, achieving 5x reduced infrastructure costs and 4x improved performance.
   icon: icons/quote-icon.svg
   logoUrl: images/logos/powered-by/octo.png
@@ -65,6 +70,16 @@
   icon: icons/quote-icon.svg
   logoUrl: images/logos/powered-by/hop.png
   linkUrl: case-studies/hop/index.html
+  linkText: Learn more
+- text: At Yelp, Apache Beam allows teams to create custom streaming pipelines using Python, eliminating the need to switch to Scala or Java.
+  icon: icons/quote-icon.svg
+  logoUrl: /images/logos/powered-by/yelp.png
+  linkUrl: case-studies/yelp_streaming/index.html
+  linkText: Learn more
+- text: Accenture Baltics uses Apache Beam on Google Cloud to build a robust data processing infrastructure for a sustainable energy leader.They use Beam to democratize data access, process data in real-time, and handle complex ETL tasks.
+  icon: icons/quote-icon.svg
+  logoUrl: /images/logos/powered-by/accenture.png
+  linkUrl: case-studies/accenture_baltics/index.html
   linkText: Learn more
 - text: Have a story to share? Your logo could be here.
   icon: icons/quote-icon.svg

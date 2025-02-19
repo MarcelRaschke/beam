@@ -40,7 +40,7 @@ task copyDockerfileDependencies(type: Copy) {
 }
 
 task copyRequirementsFile(type: Copy) {
-    from project(':sdks:python:container:py38').fileTree("./")
+    from project(':sdks:python:container:py39').fileTree("./")
     include 'base_image_requirements.txt'
     rename 'base_image_requirements.txt', 'requirements.txt'
     setDuplicatesStrategy(DuplicatesStrategy.INCLUDE)
@@ -57,7 +57,6 @@ def copyLicenseScripts = tasks.register("copyLicenseScripts", Copy){
     into "build/target/license_scripts"
 }
 
-def useBuildx = project.containerPlatforms() != [project.nativeArchitecture()]
 def pushContainers = project.rootProject.hasProperty(["isRelease"]) || project.rootProject.hasProperty("push-containers")
 
 docker {
@@ -71,9 +70,9 @@ docker {
   // tags used by dockerTag task
   tags containerImageTags()
   files "./build"
-  buildx useBuildx
+  buildx project.useBuildx()
   platform(*project.containerPlatforms())
-  load useBuildx && !pushContainers
+  load project.useBuildx() && !pushContainers
   push pushContainers
 }
 
@@ -99,5 +98,5 @@ if (project.rootProject.hasProperty(["docker-pull-licenses"])) {
 }
 
 task pushAll {
-  dependsOn dockerPush
+  dependsOn docker
 }

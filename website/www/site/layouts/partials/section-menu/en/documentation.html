@@ -76,6 +76,7 @@
             <li><a href="/documentation/io/built-in/cdap/">CDAP I/O connector</a></li>
             <li><a href="/documentation/io/built-in/sparkreceiver/">Spark Receiver I/O connector</a></li>
             <li><a href="/documentation/io/built-in/singlestore/">SingleStoreDB I/O connector</a></li>
+            <li><a href="/documentation/io/built-in/webapis/">Web APIs I/O connector</a></li>
           </ul>
         </li>
 
@@ -185,6 +186,7 @@
       </ul>
     </li>
     <li><a href="/documentation/programming-guide/#batched-dofns">Batched DoFns</a></li>
+    <li><a href="/documentation/programming-guide/#transform-service">Transform service</a></li>
   </ul>
 </li>
 <li class="section-nav-item--collapsible">
@@ -210,6 +212,7 @@
     <li><a href="/documentation/patterns/schema/">Schema</a></li>
     <li><a href="/documentation/patterns/bqml/">BigQuery ML</a></li>
     <li><a href="/documentation/patterns/grouping-elements-for-efficient-external-service-calls/">Grouping elements for efficient external service calls</a></li>
+    <li><a href="/documentation/patterns/shared-class/">Cache using a shared object</a></li>
   </ul>
 </li>
 <li class="section-nav-item--collapsible">
@@ -232,6 +235,7 @@
     <li class="section-nav-item--collapsible">
       <span class="section-nav-list-title">Data processing</span>
       <ul class="section-nav-list">
+        <li><a href="/documentation/ml/preprocess-data/">Preprocess data</a></li>
         <li><a href="/documentation/ml/data-processing/">Explore your data</a></li>
       </ul>
     </li>
@@ -249,6 +253,7 @@
         <li><a href="/documentation/ml/model-evaluation/">ML model evaluation</a></li>
       </ul>
     </li>
+    <li><a href="/documentation/ml/ml-dependency-extras/">ML Dependency Extras</a></li>
     <li class="section-nav-item--collapsible">
       <span class="section-nav-list-title">Use cases</span>
       <ul class="section-nav-list">
@@ -286,11 +291,20 @@
           <span class="section-nav-list-title">Element-wise</span>
 
           <ul class="section-nav-list">
+            <li class="section-nav-item--collapsible">
+              <span class="section-nav-list-title">Enrichment</span>
+              <ul class="section-nav-list">
+                <li><a href="/documentation/transforms/python/elementwise/enrichment/">Overview</a></li>
+                <li><a href="/documentation/transforms/python/elementwise/enrichment-bigtable/">Bigtable example</a></li>
+                <li><a href="/documentation/transforms/python/elementwise/enrichment-vertexai/">Vertex AI Feature Store examples</a></li>
+              </ul>
+              </li>
             <li><a href="/documentation/transforms/python/elementwise/filter/">Filter</a></li>
             <li><a href="/documentation/transforms/python/elementwise/flatmap/">FlatMap</a></li>
             <li><a href="/documentation/transforms/python/elementwise/keys/">Keys</a></li>
             <li><a href="/documentation/transforms/python/elementwise/kvswap/">KvSwap</a></li>
             <li><a href="/documentation/transforms/python/elementwise/map/">Map</a></li>
+            <li><a href="/documentation/transforms/python/elementwise/mltransform/">MLTransform</a></li>
             <li><a href="/documentation/transforms/python/elementwise/pardo/">ParDo</a></li>
             <li><a href="/documentation/transforms/python/elementwise/partition/">Partition</a></li>
             <li><a href="/documentation/transforms/python/elementwise/regex/">Regex</a></li>
@@ -312,6 +326,9 @@
           <span class="section-nav-list-title">Aggregation</span>
 
           <ul class="section-nav-list">
+            <li><a href="/documentation/transforms/python/aggregation/approximatequantiles/">ApproximateQuantiles</a></li>
+            <li><a href="/documentation/transforms/python/aggregation/approximateunique/">ApproximateUnique</a></li>
+            <li><a href="/documentation/transforms/python/aggregation/batchelements/">BatchElements</a></li>
             <li><a href="/documentation/transforms/python/aggregation/cogroupbykey/">CoGroupByKey</a></li>
             <li><a href="/documentation/transforms/python/aggregation/combineglobally/">CombineGlobally</a></li>
             <li><a href="/documentation/transforms/python/aggregation/combineperkey/">CombinePerKey</a></li>
@@ -328,6 +345,7 @@
             <li><a href="/documentation/transforms/python/aggregation/sample/">Sample</a></li>
             <li><a href="/documentation/transforms/python/aggregation/sum/">Sum</a></li>
             <li><a href="/documentation/transforms/python/aggregation/top/">Top</a></li>
+            <li><a href="/documentation/transforms/python/aggregation/tolist/">ToList</a></li>
           </ul>
         </li>
         <li class="section-nav-item--collapsible">

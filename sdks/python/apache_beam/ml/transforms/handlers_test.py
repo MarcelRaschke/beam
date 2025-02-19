@@ -20,9 +20,9 @@ import os
 import shutil
 import sys
 import tempfile
-import typing
 import unittest
-from typing import List
+import uuid
+from collections.abc import Sequence
 from typing import NamedTuple
 from typing import Union
 
@@ -30,6 +30,7 @@ import numpy as np
 from parameterized import parameterized
 
 import apache_beam as beam
+from apache_beam.io.filesystems import FileSystems
 
 # pylint: disable=wrong-import-position, ungrouped-imports
 try:
@@ -58,20 +59,12 @@ class _MultiplyOperation(TFTOperation):
     return {output_column_name: inputs * 10}
 
 
-class _FakeOperationWithArtifacts(TFTOperation):
-  def apply_transform(self, inputs, output_column_name, **kwargs):
-    return {output_column_name: inputs}
-
-  def get_artifacts(self, data, col_name):
-    return {'artifact': tf.convert_to_tensor([1])}
-
-
 class IntType(NamedTuple):
   x: int
 
 
 class ListIntType(NamedTuple):
-  x: List[int]
+  x: list[int]
 
 
 class NumpyType(NamedTuple):
@@ -106,16 +99,6 @@ class TFTProcessHandlerTest(unittest.TestCase):
     actual_result = process_handler.process_data_fn(inputs)
     self.assertDictEqual(actual_result, expected_result)
 
-  def test_preprocessing_fn_with_artifacts(self):
-    process_handler = handlers.TFTProcessHandler(
-        transforms=[_FakeOperationWithArtifacts(columns=['x'])],
-        artifact_location=self.artifact_location)
-    inputs = {'x': [1, 2, 3]}
-    preprocessing_fn = process_handler.process_data_fn
-    actual_result = preprocessing_fn(inputs)
-    expected_result = {'x': [1, 2, 3], 'artifact': tf.convert_to_tensor([1])}
-    self.assertDictEqual(actual_result, expected_result)
-
   def test_input_type_from_schema_named_tuple_pcoll(self):
     data = [{'x': 1}]
     with beam.Pipeline() as p:
@@ -127,7 +110,7 @@ class TFTProcessHandlerTest(unittest.TestCase):
         artifact_location=self.artifact_location)
     inferred_input_type = process_handler._map_column_names_to_types(
         element_type)
-    expected_input_type = dict(x=List[int])
+    expected_input_type = dict(x=list[int])
 
     self.assertEqual(inferred_input_type, expected_input_type)
 
@@ -142,7 +125,7 @@ class TFTProcessHandlerTest(unittest.TestCase):
         artifact_location=self.artifact_location)
     inferred_input_type = process_handler._map_column_names_to_types(
         element_type)
-    expected_input_type = dict(x=List[int])
+    expected_input_type = dict(x=list[int])
     self.assertEqual(inferred_input_type, expected_input_type)
 
   def test_input_type_from_row_type_pcoll(self):
@@ -156,7 +139,7 @@ class TFTProcessHandlerTest(unittest.TestCase):
         artifact_location=self.artifact_location)
     inferred_input_type = process_handler._map_column_names_to_types(
         element_type)
-    expected_input_type = dict(x=List[int])
+    expected_input_type = dict(x=list[int])
     self.assertEqual(inferred_input_type, expected_input_type)
 
   def test_input_type_from_row_type_pcoll_list(self):
@@ -165,14 +148,14 @@ class TFTProcessHandlerTest(unittest.TestCase):
       data = (
           p | beam.Create(data)
           | beam.Map(lambda ele: beam.Row(x=list(ele['x']))).with_output_types(
-              beam.row_type.RowTypeConstraint.from_fields([('x', List[int])])))
+              beam.row_type.RowTypeConstraint.from_fields([('x', list[int])])))
 
     element_type = data.element_type
     process_handler = handlers.TFTProcessHandler(
         artifact_location=self.artifact_location)
     inferred_input_type = process_handler._map_column_names_to_types(
         element_type)
-    expected_input_type = dict(x=List[int])
+    expected_input_type = dict(x=list[int])
     self.assertEqual(inferred_input_type, expected_input_type)
 
   def test_input_type_from_named_tuple_pcoll_numpy(self):
@@ -206,8 +189,8 @@ class TFTProcessHandlerTest(unittest.TestCase):
       self.assertIsInstance(feature_spec, tf.io.VarLenFeature)
 
   def test_tensorflow_raw_data_metadata_primitive_types_in_containers(self):
-    input_types = dict([("x", List[int]), ("y", List[float]),
-                        ("k", List[bytes]), ("l", List[str])])
+    input_types = dict([("x", list[int]), ("y", list[float]),
+                        ("k", list[bytes]), ("l", list[str])])
     process_handler = handlers.TFTProcessHandler(
         artifact_location=self.artifact_location)
     for col_name, typ in input_types.items():
@@ -227,7 +210,7 @@ class TFTProcessHandlerTest(unittest.TestCase):
       self.assertIsInstance(feature_spec, tf.io.VarLenFeature)
 
   def test_tensorflow_raw_data_metadata_numpy_types(self):
-    input_types = dict(x=np.int64, y=np.float32, z=List[np.int64])
+    input_types = dict(x=np.int64, y=np.float32, z=list[np.int64])
     process_handler = handlers.TFTProcessHandler(
         artifact_location=self.artifact_location)
     for col_name, typ in input_types.items():
@@ -293,9 +276,9 @@ class TFTProcessHandlerTest(unittest.TestCase):
         schema_utils.schema_from_feature_spec(raw_data_feature_spec))
 
     expected_transformed_data_schema = {
-        'x': typing.Sequence[np.float32],
-        'y': typing.Sequence[np.float32],
-        'z': typing.Sequence[bytes]
+        'x': Sequence[np.float32],
+        'y': Sequence[np.float32],
+        'z': Sequence[bytes]
     }
 
     actual_transformed_data_schema = (
@@ -316,14 +299,17 @@ class TFTProcessHandlerTest(unittest.TestCase):
           transforms=[tft.ScaleTo01(columns=['x'])],
           artifact_location=self.artifact_location,
       )
-      _ = process_handler.process_data(raw_data)
+      _ = raw_data | process_handler
 
       self.assertTrue(
-          os.path.exists(
+          FileSystems.exists(
+              # To check the gcs directory with FileSystems, the dir path must
+              # end with /
               os.path.join(
-                  self.artifact_location, handlers.RAW_DATA_METADATA_DIR)))
+                  self.artifact_location,
+                  handlers.RAW_DATA_METADATA_DIR + '/')))
       self.assertTrue(
-          os.path.exists(
+          FileSystems.exists(
               os.path.join(
                   self.artifact_location,
                   handlers.RAW_DATA_METADATA_DIR,
@@ -333,7 +319,7 @@ class TFTProcessHandlerTest(unittest.TestCase):
       raw_data = (p | beam.Create([{'x': np.array([2, 5])}]))
       process_handler = handlers.TFTProcessHandler(
           artifact_location=self.artifact_location, artifact_mode='consume')
-      transformed_data = process_handler.process_data(raw_data)
+      transformed_data = raw_data | process_handler
       transformed_data |= beam.Map(lambda x: x.x)
 
       # the previous min is 1 and max is 6. So this should scale by (1, 6)
@@ -512,7 +498,7 @@ class TFTProcessHandlerTest(unittest.TestCase):
           transforms=[scale_to_0_1_fn],
           artifact_location=self.artifact_location,
       )
-      transformed_pcoll = process_handler.process_data(raw_data)
+      transformed_pcoll = raw_data | process_handler
       transformed_pcoll_x = transformed_pcoll | beam.Map(lambda x: x.x)
       transformed_pcoll_y = transformed_pcoll | beam.Map(lambda x: x.y)
       assert_that(
@@ -538,7 +524,7 @@ class TFTProcessHandlerTest(unittest.TestCase):
           transforms=[tft.ScaleTo01(columns=['x'])],
           artifact_location=self.artifact_location,
       )
-      _ = process_handler.process_data(raw_data)
+      _ = raw_data | process_handler
 
     test_data = [{
         'x': np.array([2, 5]), 'y': np.array([1, 2]), 'z': 'fake_string'
@@ -566,7 +552,7 @@ class TFTProcessHandlerTest(unittest.TestCase):
       raw_data = (p | beam.Create(test_data))
       process_handler = handlers.TFTProcessHandler(
           artifact_location=self.artifact_location, artifact_mode='consume')
-      transformed_data = process_handler.process_data(raw_data)
+      transformed_data = raw_data | process_handler
 
       transformed_data_x = transformed_data | beam.Map(lambda x: x.x)
       transformed_data_y = transformed_data | beam.Map(lambda x: x.y)
@@ -586,6 +572,61 @@ class TFTProcessHandlerTest(unittest.TestCase):
           transformed_data_z,
           equal_to(expected_test_data_z, equals_fn=np.array_equal),
           label='unused column: z')
+
+  def test_handler_with_same_input_elements(self):
+    with beam.Pipeline() as p:
+      data = [
+          {
+              'x': 'I'
+          },
+          {
+              'x': 'love'
+          },
+          {
+              'x': 'Beam'
+          },
+          {
+              'x': 'Beam'
+          },
+          {
+              'x': 'is'
+          },
+          {
+              'x': 'awesome'
+          },
+      ]
+      raw_data = (p | beam.Create(data))
+      process_handler = handlers.TFTProcessHandler(
+          transforms=[tft.ComputeAndApplyVocabulary(columns=['x'])],
+          artifact_location=self.artifact_location,
+      )
+      transformed_data = raw_data | process_handler
+
+      expected_data = [
+          beam.Row(x=np.array([4])),
+          beam.Row(x=np.array([1])),
+          beam.Row(x=np.array([0])),
+          beam.Row(x=np.array([0])),
+          beam.Row(x=np.array([2])),
+          beam.Row(x=np.array([3])),
+      ]
+
+      expected_data_x = [row.x for row in expected_data]
+      actual_data_x = transformed_data | beam.Map(lambda x: x.x)
+
+      assert_that(
+          actual_data_x,
+          equal_to(expected_data_x, equals_fn=np.array_equal),
+          label='transformed data')
+
+
+class TFTProcessHandlerTestWithGCSLocation(TFTProcessHandlerTest):
+  def setUp(self) -> None:
+    self.artifact_location = self.gcs_artifact_location = os.path.join(
+        'gs://temp-storage-for-perf-tests/tft_handler', uuid.uuid4().hex)
+
+  def tearDown(self):
+    pass
 
 
 if __name__ == '__main__':
