@@ -15,7 +15,6 @@
 # limitations under the License.
 #
 
-# cython: profile=True
 
 cimport cython
 
@@ -218,6 +217,18 @@ cdef class PaneInfoCoderImpl(StreamCoderImpl):
 cdef libc.stdint.uint64_t _TIME_SHIFT
 cdef libc.stdint.int64_t MIN_TIMESTAMP_micros
 cdef libc.stdint.int64_t MAX_TIMESTAMP_micros
+
+
+cdef class _OrderedUnionCoderImpl(StreamCoderImpl):
+  cdef tuple _types
+  cdef tuple _coder_impls
+  cdef CoderImpl _fallback_coder_impl
+
+  @cython.locals(ix=int, c=CoderImpl)
+  cpdef encode_to_stream(self, value, OutputStream stream, bint nested)
+
+  @cython.locals(ix=int, c=CoderImpl)
+  cpdef decode_from_stream(self, InputStream stream, bint nested)
 
 
 cdef class WindowedValueCoderImpl(StreamCoderImpl):

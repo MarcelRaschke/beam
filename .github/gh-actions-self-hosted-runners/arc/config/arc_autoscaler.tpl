@@ -27,7 +27,7 @@ spec:
     name: ${name}
   minReplicas: ${min_runners}
   maxReplicas: ${max_runners}
-  %{~ if webhook_scaling == "true" ~}
+  %{~ if webhook_scaling ~}
   scaleUpTriggers:
     - githubEvent:
         workflowJob: {}
@@ -39,4 +39,7 @@ spec:
     scaleDownThreshold: '0.25'
     scaleUpFactor: '2'
     scaleDownFactor: '0.5'
+  - type: TotalNumberOfQueuedAndInProgressWorkflowRuns
+    repositoryNames:
+    - beam
   %{~ endif ~}

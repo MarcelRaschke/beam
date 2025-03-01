@@ -22,6 +22,7 @@
 import importlib
 import logging
 from typing import TYPE_CHECKING
+from typing import Iterable
 from typing import Optional
 
 from apache_beam.options.pipeline_options import PipelineOptions
@@ -29,6 +30,7 @@ from apache_beam.options.pipeline_options import PortableOptions
 from apache_beam.options.pipeline_options import SetupOptions
 from apache_beam.options.pipeline_options import StandardOptions
 from apache_beam.options.pipeline_options import TypeOptions
+from apache_beam.portability import common_urns
 from apache_beam.portability.api import beam_runner_api_pb2
 from apache_beam.runners.common import group_by_key_input_visitor
 from apache_beam.transforms import environments
@@ -53,9 +55,7 @@ _RUNNER_MAP['pythonrpcdirectrunner'] = (
 _LOGGER = logging.getLogger(__name__)
 
 
-def create_runner(runner_name):
-  # type: (str) -> PipelineRunner
-
+def create_runner(runner_name: str) -> 'PipelineRunner':
   """For internal use only; no backwards-compatibility guarantees.
 
   Creates a runner instance from a runner class name.
@@ -111,13 +111,10 @@ class PipelineRunner(object):
   provide a new implementation for clear_pvalue(), which is used to wipe out
   materialized values in order to reduce footprint.
   """
-
-  def run(self,
-          transform,  # type: PTransform
-          options=None  # type: Optional[PipelineOptions]
-         ):
-    # type: (...) -> PipelineResult
-
+  def run(
+      self,
+      transform: 'PTransform',
+      options: Optional[PipelineOptions] = None) -> 'PipelineResult':
     """Run the given transform or callable with this runner.
 
     Blocks until the pipeline is complete.  See also `PipelineRunner.run_async`.
@@ -126,12 +123,10 @@ class PipelineRunner(object):
     result.wait_until_finish()
     return result
 
-  def run_async(self,
-                transform,  # type: PTransform
-                options=None  # type: Optional[PipelineOptions]
-               ):
-    # type: (...) -> PipelineResult
-
+  def run_async(
+      self,
+      transform: 'PTransform',
+      options: Optional[PipelineOptions] = None) -> 'PipelineResult':
     """Run the given transform or callable with this runner.
 
     May return immediately, executing the pipeline in the background.
@@ -169,12 +164,7 @@ class PipelineRunner(object):
         options.view_as(PortableOptions))
 
   def run_pipeline(
-      self,
-      pipeline,  # type: Pipeline
-      options  # type: PipelineOptions
-  ):
-    # type: (...) -> PipelineResult
-
+      self, pipeline: 'Pipeline', options: PipelineOptions) -> 'PipelineResult':
     """Execute the entire pipeline or the sub-DAG reachable from a node.
     """
     pipeline.visit(
@@ -192,11 +182,11 @@ class PipelineRunner(object):
             default_environment=self.default_environment(options)),
         options)
 
-  def apply(self,
-            transform,  # type: PTransform
-            input,  # type: Optional[pvalue.PValue]
-            options  # type: PipelineOptions
-           ):
+  def apply(
+      self,
+      transform: 'PTransform',
+      input: Optional['pvalue.PValue'],
+      options: PipelineOptions):
     # TODO(robertwb): Remove indirection once internal references are fixed.
     return self.apply_PTransform(transform, input, options)
 
@@ -207,6 +197,33 @@ class PipelineRunner(object):
   def is_fnapi_compatible(self):
     """Whether to enable the beam_fn_api experiment by default."""
     return True
+
+  def check_requirements(
+      self,
+      pipeline_proto: beam_runner_api_pb2.Pipeline,
+      supported_requirements: Iterable[str]):
+    """Check that this runner can satisfy all pipeline requirements."""
+
+    # Imported here to avoid circular dependencies.
+    # pylint: disable=wrong-import-order, wrong-import-position
+    from apache_beam.runners.portability.fn_api_runner import translations
+    supported_requirements = set(supported_requirements)
+    for requirement in pipeline_proto.requirements:
+      if requirement not in supported_requirements:
+        raise ValueError(
+            'Unable to run pipeline with requirement: %s' % requirement)
+    for transform in pipeline_proto.components.transforms.values():
+      if transform.spec.urn == common_urns.primitives.TEST_STREAM.urn:
+        if common_urns.primitives.TEST_STREAM.urn not in supported_requirements:
+          raise NotImplementedError(transform.spec.urn)
+      elif transform.spec.urn in translations.PAR_DO_URNS:
+        payload = beam_runner_api_pb2.ParDoPayload.FromString(
+            transform.spec.payload)
+        for timer in payload.timer_family_specs.values():
+          if timer.time_domain not in (
+              beam_runner_api_pb2.TimeDomain.EVENT_TIME,
+              beam_runner_api_pb2.TimeDomain.PROCESSING_TIME):
+            raise NotImplementedError(timer.time_domain)
 
 
 # FIXME: replace with PipelineState(str, enum.Enum)
@@ -252,7 +269,7 @@ class PipelineResult(object):
     """Return the current state of the pipeline execution."""
     return self._state
 
-  def wait_until_finish(self, duration=None):
+  def wait_until_finish(self, duration=None):  # pylint: disable=unused-argument
     """Waits until the pipeline finishes and returns the final status.
 
     Args:
@@ -269,7 +286,8 @@ class PipelineResult(object):
     Returns:
       The final state of the pipeline, or :data:`None` on timeout.
     """
-    raise NotImplementedError
+    if not PipelineState.is_terminal(self._state):
+      raise NotImplementedError()
 
   def cancel(self):
     """Cancels the pipeline execution.
@@ -283,7 +301,7 @@ class PipelineResult(object):
     Returns:
       The final state of the pipeline.
     """
-    raise NotImplementedError
+    raise NotImplementedError()
 
   def metrics(self):
     """Returns :class:`~apache_beam.metrics.metric.MetricResults` object to
@@ -293,7 +311,7 @@ class PipelineResult(object):
       NotImplementedError: If the runner does not support this
         operation.
     """
-    raise NotImplementedError
+    raise NotImplementedError()
 
   # pylint: disable=unused-argument
   def aggregated_values(self, aggregator_or_name):

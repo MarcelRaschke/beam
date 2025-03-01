@@ -25,15 +25,20 @@ import com.google.cloud.spanner.ResultSet;
 import com.google.cloud.spanner.SpannerException;
 import com.google.cloud.spanner.Struct;
 import com.google.cloud.spanner.TimestampBound;
+import java.util.Objects;
 import org.apache.beam.runners.core.metrics.ServiceCallMetric;
 import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.metrics.Lineage;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** A naive version of Spanner read that doesn't use the Batch API. */
 @VisibleForTesting
@@ -43,6 +48,8 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 })
 abstract class NaiveSpannerRead
     extends PTransform<PCollection<ReadOperation>, PCollection<Struct>> {
+
+  private static final Logger LOG = LoggerFactory.getLogger(NaiveSpannerRead.class);
 
   public static NaiveSpannerRead create(
       SpannerConfig spannerConfig,
@@ -80,6 +87,10 @@ abstract class NaiveSpannerRead
     private final @Nullable PCollectionView<Transaction> txView;
     private transient SpannerAccessor spannerAccessor;
 
+    // resolved at runtime for metrics report purpose. SpannerConfig may not have projectId set.
+    private transient String projectId;
+    private transient @Nullable String reportedLineage;
+
     NaiveSpannerReadFn(SpannerConfig config, @Nullable PCollectionView<Transaction> transaction) {
       this.config = config;
       this.txView = transaction;
@@ -88,6 +99,7 @@ abstract class NaiveSpannerRead
     @Setup
     public void setup() throws Exception {
       spannerAccessor = SpannerAccessor.getOrCreate(config);
+      projectId = SpannerIO.resolveSpannerProjectId(config);
     }
 
     @Teardown
@@ -109,9 +121,26 @@ abstract class NaiveSpannerRead
         }
       } catch (SpannerException e) {
         serviceCallMetric.call(e.getErrorCode().getGrpcStatusCode().toString());
+        LOG.error("Error while reading operation: " + op, e);
         throw (e);
       }
       serviceCallMetric.call("ok");
+      // Report Lineage metrics
+      @Nullable String tableName = op.tryGetTableName();
+      if (!Objects.equals(reportedLineage, tableName)) {
+        ImmutableList.Builder<String> segments =
+            ImmutableList.<String>builder()
+                .add(
+                    projectId,
+                    spannerAccessor.getInstanceConfigId(),
+                    config.getInstanceId().get(),
+                    config.getDatabaseId().get());
+        if (tableName != null) {
+          segments.add(tableName);
+        }
+        Lineage.getSources().add("spanner", segments.build());
+        reportedLineage = tableName;
+      }
     }
 
     private ResultSet execute(ReadOperation op, BatchReadOnlyTransaction readOnlyTransaction) {

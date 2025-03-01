@@ -17,8 +17,7 @@
 
 import argparse
 import logging
-from typing import Iterable
-from typing import Tuple
+from collections.abc import Iterable
 
 import numpy
 
@@ -33,7 +32,7 @@ from apache_beam.options.pipeline_options import SetupOptions
 from apache_beam.runners.runner import PipelineResult
 
 
-def process_input(row: str) -> Tuple[int, numpy.ndarray]:
+def process_input(row: str) -> tuple[int, numpy.ndarray]:
   data = row.split(',')
   label, pixels = int(data[0]), data[1:]
   pixels = [int(pixel) for pixel in pixels]
@@ -46,7 +45,7 @@ class PostProcessor(beam.DoFn):
   """Process the PredictionResult to get the predicted label.
   Returns a comma separated string with true label and predicted label.
   """
-  def process(self, element: Tuple[int, PredictionResult]) -> Iterable[str]:
+  def process(self, element: tuple[int, PredictionResult]) -> Iterable[str]:
     label, prediction_result = element
     prediction = numpy.argmax(prediction_result.inference, axis=0)
     yield '{},{}'.format(label, prediction)
@@ -70,6 +69,13 @@ def parse_known_args(argv):
       dest='model_path',
       required=True,
       help='Path to load the Tensorflow model for Inference.')
+  parser.add_argument(
+      '--large_model',
+      action='store_true',
+      dest='large_model',
+      default=False,
+      help='Set to true if your model is large enough to run into memory '
+      'pressure if you load multiple copies.')
   return parser.parse_known_args(argv)
 
 
@@ -89,7 +95,9 @@ def run(
   # Therefore, we use KeyedModelHandler wrapper over TFModelHandlerNumpy.
   model_loader = KeyedModelHandler(
       TFModelHandlerNumpy(
-          model_uri=known_args.model_path, model_type=ModelType.SAVED_MODEL))
+          model_uri=known_args.model_path,
+          model_type=ModelType.SAVED_MODEL,
+          large_model=known_args.large_model))
 
   pipeline = test_pipeline
   if not test_pipeline:

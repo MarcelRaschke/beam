@@ -28,6 +28,7 @@ from typing import Callable
 from typing import Dict
 from typing import List
 from typing import Optional
+from typing import Sequence
 from typing import Type
 from typing import TypeVar
 
@@ -36,6 +37,7 @@ from apache_beam.options.value_provider import RuntimeValueProvider
 from apache_beam.options.value_provider import StaticValueProvider
 from apache_beam.options.value_provider import ValueProvider
 from apache_beam.transforms.display import HasDisplayData
+from apache_beam.utils import proto_utils
 
 __all__ = [
     'PipelineOptions',
@@ -64,7 +66,7 @@ _FLAG_THAT_SETS_FALSE_VALUE = {'use_public_ips': 'no_use_public_ips'}
 
 
 def _static_value_provider_of(value_type):
-  """"Helper function to plug a ValueProvider into argparse.
+  """Helper function to plug a ValueProvider into argparse.
 
   Args:
     value_type: the type of the value. Since the type param of argparse's
@@ -101,7 +103,7 @@ class _BeamArgumentParser(argparse.ArgumentParser):
     key/value form.
     """
     # Extract the option name from positional argument ['pos_arg']
-    assert args != () and len(args[0]) >= 1
+    assert args and len(args[0]) >= 1
     if args[0][0] != '-':
       option_name = args[0]
       if kwargs.get('nargs') is None:  # make them optionally templated
@@ -147,6 +149,71 @@ class _DictUnionAction(argparse.Action):
     getattr(namespace, self.dest).update(values)
 
 
+class _GcsCustomAuditEntriesAction(argparse.Action):
+  """
+  Argparse Action for GCS custom audit entries.
+
+  According to Google Cloud Storage audit logging documentation
+  (https://cloud.google.com/storage/docs/audit-logging#add-custom-metadata), the
+  following limitations apply:
+  - keys must be 64 characters or less,
+  - values 1,200 characters or less, and
+  - a maximum of four custom metadata entries are permitted per request.
+  """
+  MAX_KEY_LENGTH = 64
+  MAX_VALUE_LENGTH = 1200
+  MAX_ENTRIES = 4
+
+  def _exceed_entry_limit(self):
+    if 'x-goog-custom-audit-job' in self._custom_audit_entries:
+      return len(
+          self._custom_audit_entries) > _GcsCustomAuditEntriesAction.MAX_ENTRIES
+    else:
+      return len(self._custom_audit_entries) > (
+          _GcsCustomAuditEntriesAction.MAX_ENTRIES - 1)
+
+  def _add_entry(self, key, value):
+    if len(key) > _GcsCustomAuditEntriesAction.MAX_KEY_LENGTH:
+      raise argparse.ArgumentError(
+          None,
+          "The key '%s' in GCS custom audit entries exceeds the %d-character limit."  # pylint: disable=line-too-long
+          % (key, _GcsCustomAuditEntriesAction.MAX_KEY_LENGTH))
+
+    if len(value) > _GcsCustomAuditEntriesAction.MAX_VALUE_LENGTH:
+      raise argparse.ArgumentError(
+          None,
+          "The value '%s' in GCS custom audit entries exceeds the %d-character limit."  # pylint: disable=line-too-long
+          % (value, _GcsCustomAuditEntriesAction.MAX_VALUE_LENGTH))
+
+    self._custom_audit_entries[f"x-goog-custom-audit-{key}"] = value
+
+  def __call__(self, parser, namespace, values, option_string=None):
+    if not hasattr(namespace,
+                   self.dest) or getattr(namespace, self.dest) is None:
+      setattr(namespace, self.dest, {})
+      self._custom_audit_entries = getattr(namespace, self.dest)
+
+    if option_string == '--gcs_custom_audit_entries':
+      # in the format of {"key": "value"}
+      assert (isinstance(values, str))
+      sub_entries = json.loads(values)
+      for key, value in sub_entries.items():
+        self._add_entry(key, value)
+    else:  # option_string == '--gcs_custom_audit_entry'
+      # in the format of 'key=value'
+      assert (isinstance(values, str))
+      parts = values.split('=', 1)
+      key = parts[0]
+      value = parts[1] if len(parts) > 1 else ''
+      self._add_entry(key, value)
+
+    if self._exceed_entry_limit():
+      raise argparse.ArgumentError(
+          None,
+          "The maximum allowed number of GCS custom audit entries (including the default x-goo-custom-audit-job) is %d."  # pylint: disable=line-too-long
+          % _GcsCustomAuditEntriesAction.MAX_ENTRIES)
+
+
 class PipelineOptions(HasDisplayData):
   """This class and subclasses are used as containers for command line options.
 
@@ -184,9 +251,7 @@ class PipelineOptions(HasDisplayData):
   By default the options classes will use command line arguments to initialize
   the options.
   """
-  def __init__(self, flags=None, **kwargs):
-    # type: (Optional[List[str]], **Any) -> None
-
+  def __init__(self, flags: Optional[Sequence[str]] = None, **kwargs) -> None:
     """Initialize an options class.
 
     The initializer will traverse all subclasses, add all their argparse
@@ -215,6 +280,12 @@ class PipelineOptions(HasDisplayData):
     # self._flags stores a list of not yet parsed arguments, typically,
     # command-line flags. This list is shared across different views.
     # See: view_as().
+    if isinstance(flags, str):
+      # Unfortunately a single str passes the Iterable[str] test, as it is
+      # an iterable of single characters.  This is almost certainly not the
+      # intent...
+      raise ValueError(
+          "Flags must be an iterable of of strings, not a single string.")
     self._flags = flags
 
     # Build parser that will parse options recognized by the [sub]class of
@@ -246,9 +317,22 @@ class PipelineOptions(HasDisplayData):
         self._all_options[option_name] = getattr(
             self._visible_options, option_name)
 
+  def __getstate__(self):
+    # The impersonate_service_account option must be used only at submission of
+    # a Beam job. However, Beam IOs might store pipeline options
+    # within transform implementation that becomes serialized in RunnerAPI,
+    # causing this option to be inadvertently used at runtime.
+    # This serialization hook removes it.
+    if self.view_as(GoogleCloudOptions).impersonate_service_account:
+      dict_copy = dict(self.__dict__)
+      dict_copy['_all_options'] = dict(dict_copy['_all_options'])
+      dict_copy['_all_options']['impersonate_service_account'] = None
+      return dict_copy
+    else:
+      return self.__dict__
+
   @classmethod
-  def _add_argparse_args(cls, parser):
-    # type: (_BeamArgumentParser) -> None
+  def _add_argparse_args(cls, parser: _BeamArgumentParser) -> None:
     # Override this in subclasses to provide options.
     pass
 
@@ -297,11 +381,8 @@ class PipelineOptions(HasDisplayData):
   def get_all_options(
       self,
       drop_default=False,
-      add_extra_args_fn=None,  # type: Optional[Callable[[_BeamArgumentParser], None]]
-      retain_unknown_options=False
-  ):
-    # type: (...) -> Dict[str, Any]
-
+      add_extra_args_fn: Optional[Callable[[_BeamArgumentParser], None]] = None,
+      retain_unknown_options=False) -> Dict[str, Any]:
     """Returns a dictionary of all defined arguments.
 
     Returns a dictionary of all defined arguments (arguments that are defined in
@@ -334,8 +415,15 @@ class PipelineOptions(HasDisplayData):
 
     known_args, unknown_args = parser.parse_known_args(self._flags)
     if retain_unknown_options:
+      if unknown_args:
+        _LOGGER.warning(
+            'Unknown pipeline options received: %s. Ignore if flags are '
+            'used for internal purposes.' % (','.join(unknown_args)))
       i = 0
       while i < len(unknown_args):
+        # End of argument parsing.
+        if unknown_args[i] == '--':
+          break
         # Treat all unary flags as booleans, and all binary argument values as
         # strings.
         if not unknown_args[i].startswith('-'):
@@ -386,12 +474,40 @@ class PipelineOptions(HasDisplayData):
 
     return result
 
+  def to_runner_api(self):
+    def to_struct_value(o):
+      if isinstance(o, (bool, int, str)):
+        return o
+      elif isinstance(o, (tuple, list)):
+        return [to_struct_value(e) for e in o]
+      elif isinstance(o, dict):
+        return {str(k): to_struct_value(v) for k, v in o.items()}
+      else:
+        return str(o)  # Best effort.
+
+    return proto_utils.pack_Struct(
+        **{
+            f'beam:option:{k}:v1': to_struct_value(v)
+            for (k, v) in self.get_all_options(
+                drop_default=True, retain_unknown_options=True).items()
+            if v is not None
+        })
+
+  @classmethod
+  def from_runner_api(cls, proto_options):
+    def from_urn(key):
+      assert key.startswith('beam:option:')
+      assert key.endswith(':v1')
+      return key[12:-3]
+
+    return cls(
+        **{from_urn(key): value
+           for (key, value) in proto_options.items()})
+
   def display_data(self):
     return self.get_all_options(drop_default=True, retain_unknown_options=True)
 
-  def view_as(self, cls):
-    # type: (Type[PipelineOptionsT]) -> PipelineOptionsT
-
+  def view_as(self, cls: Type[PipelineOptionsT]) -> PipelineOptionsT:
     """Returns a view of current object as provided PipelineOption subclass.
 
     Example Usage::
@@ -430,13 +546,11 @@ class PipelineOptions(HasDisplayData):
     view._all_options = self._all_options
     return view
 
-  def _visible_option_list(self):
-    # type: () -> List[str]
+  def _visible_option_list(self) -> List[str]:
     return sorted(
         option for option in dir(self._visible_options) if option[0] != '_')
 
-  def __dir__(self):
-    # type: () -> List[str]
+  def __dir__(self) -> List[str]:
     return sorted(
         dir(type(self)) + list(self.__dict__) + self._visible_option_list())
 
@@ -480,6 +594,7 @@ class StandardOptions(PipelineOptions):
       'apache_beam.runners.interactive.interactive_runner.InteractiveRunner',
       'apache_beam.runners.portability.flink_runner.FlinkRunner',
       'apache_beam.runners.portability.portable_runner.PortableRunner',
+      'apache_beam.runners.portability.prism_runner.PrismRunner',
       'apache_beam.runners.portability.spark_runner.SparkRunner',
       'apache_beam.runners.test.TestDirectRunner',
       'apache_beam.runners.test.TestDataflowRunner',
@@ -515,14 +630,53 @@ class StandardOptions(PipelineOptions):
             'at transform level. Interpretation of hints is defined by '
             'Beam runners.'))
 
+    parser.add_argument(
+        '--auto_unique_labels',
+        default=False,
+        action='store_true',
+        help='Whether to automatically generate unique transform labels '
+        'for every transform. The default behavior is to raise an '
+        'exception if a transform is created with a non-unique label. '
+        'Using --auto_unique_labels could cause data loss when '
+        'updating a pipeline or reloading the job state. '
+        'This is not recommended for streaming jobs.')
+
+    parser.add_argument(
+        '--no_wait_until_finish',
+        default=False,
+        action='store_true',
+        help='By default, the "with" statement waits for the job to '
+        'complete. Set this flag to bypass this behavior and continue '
+        'execution immediately')
+
+
+class StreamingOptions(PipelineOptions):
+  @classmethod
+  def _add_argparse_args(cls, parser):
+    parser.add_argument(
+        '--update_compatibility_version',
+        default=None,
+        nargs='?',
+        const=None,
+        help='Attempt to produce a pipeline compatible with the given prior '
+        'version of the Beam SDK. '
+        'See for example, https://cloud.google.com/dataflow/docs/guides/'
+        'updating-a-pipeline')
+
 
 class CrossLanguageOptions(PipelineOptions):
+  @staticmethod
+  def _beam_services_from_enviroment():
+    return json.loads(os.environ.get('BEAM_SERVICE_OVERRIDES') or '{}')
+
   @classmethod
   def _add_argparse_args(cls, parser):
     parser.add_argument(
         '--beam_services',
-        type=json.loads,
-        default={},
+        type=lambda s: {
+            **cls._beam_services_from_enviroment(), **json.loads(s)
+        },
+        default=cls._beam_services_from_enviroment(),
         help=(
             'For convenience, Beam provides the ability to automatically '
             'download and start various services (such as expansion services) '
@@ -531,7 +685,9 @@ class CrossLanguageOptions(PipelineOptions):
             'use pre-started services or non-default pre-existing artifacts to '
             'start the given service. '
             'Should be a json mapping of gradle build targets to pre-built '
-            'artifacts (e.g. jar files) expansion endpoints (e.g. host:port).'))
+            'artifacts (e.g. jar files) or expansion endpoints '
+            '(e.g. host:port). Defaults to the value of BEAM_SERVICE_OVERRIDES '
+            'from the environment.'))
 
     parser.add_argument(
         '--use_transform_service',
@@ -546,9 +702,9 @@ def additional_option_ptransform_fn():
 
 
 # Optional type checks that aren't enabled by default.
-additional_type_checks = {
+additional_type_checks: Dict[str, Callable[[], None]] = {
     'ptransform_fn': additional_option_ptransform_fn,
-}  # type: Dict[str, Callable[[], None]]
+}
 
 
 def enable_all_additional_type_checks():
@@ -837,6 +993,41 @@ class GoogleCloudOptions(PipelineOptions):
             'Controls the OAuth scopes that will be requested when creating '
             'GCP credentials. Note: If set programmatically, must be set as a '
             'list of strings'))
+    parser.add_argument(
+        '--enable_bucket_read_metric_counter',
+        default=False,
+        action='store_true',
+        help='Create metrics reporting the approximate number of bytes read '
+        'per bucket.')
+    parser.add_argument(
+        '--enable_bucket_write_metric_counter',
+        default=False,
+        action='store_true',
+        help=
+        'Create metrics reporting the approximate number of bytes written per '
+        'bucket.')
+    parser.add_argument(
+        '--no_gcsio_throttling_counter',
+        default=False,
+        action='store_true',
+        help='Throttling counter in GcsIO is enabled by default. Set '
+        '--no_gcsio_throttling_counter to avoid it.')
+    parser.add_argument(
+        '--enable_gcsio_blob_generation',
+        default=False,
+        action='store_true',
+        help='Use blob generation when mutating blobs in GCSIO to '
+        'mitigate race conditions at the cost of more HTTP requests.')
+    parser.add_argument(
+        '--gcs_custom_audit_entry',
+        '--gcs_custom_audit_entries',
+        dest='gcs_custom_audit_entries',
+        action=_GcsCustomAuditEntriesAction,
+        default=None,
+        help='Custom information to be attached to audit logs. '
+        'Entries are key value pairs separated by = '
+        '(e.g. --gcs_custom_audit_entry key=value) or a JSON string '
+        '(e.g. --gcs_custom_audit_entries=\'{ "user": "test", "id": "12" }\').')
 
   def _create_default_gcs_bucket(self):
     try:
@@ -850,23 +1041,64 @@ class GoogleCloudOptions(PipelineOptions):
     else:
       return None
 
+  # Log warning if soft delete policy is enabled in a gcs bucket
+  # that is specified in an argument.
+  def _warn_if_soft_delete_policy_enabled(self, arg_name):
+    # skip the check if it is in dry-run mode because the later step requires
+    # internet connection to access GCS
+    if self.view_as(TestOptions).dry_run:
+      return
+
+    gcs_path = getattr(self, arg_name, None)
+    try:
+      from apache_beam.io.gcp import gcsio
+      if gcsio.GcsIO().is_soft_delete_enabled(gcs_path):
+        _LOGGER.warning(
+            "Bucket specified in %s has soft-delete policy enabled."
+            " To avoid being billed for unnecessary storage costs, turn"
+            " off the soft delete feature on buckets that your Dataflow"
+            " jobs use for temporary and staging storage. For more"
+            " information, see"
+            " https://cloud.google.com/storage/docs/use-soft-delete"
+            "#remove-soft-delete-policy." % arg_name)
+    except ImportError:
+      _LOGGER.warning('Unable to check soft delete policy due to import error.')
+
+  # If either temp or staging location has an issue, we use the valid one for
+  # both locations. If both are bad we return an error.
+  def _handle_temp_and_staging_locations(self, validator):
+    temp_errors = validator.validate_gcs_path(self, 'temp_location')
+    staging_errors = validator.validate_gcs_path(self, 'staging_location')
+    if temp_errors and not staging_errors:
+      setattr(self, 'temp_location', getattr(self, 'staging_location'))
+      self._warn_if_soft_delete_policy_enabled('staging_location')
+      return []
+    elif staging_errors and not temp_errors:
+      setattr(self, 'staging_location', getattr(self, 'temp_location'))
+      self._warn_if_soft_delete_policy_enabled('temp_location')
+      return []
+    elif not staging_errors and not temp_errors:
+      self._warn_if_soft_delete_policy_enabled('temp_location')
+      self._warn_if_soft_delete_policy_enabled('staging_location')
+      return []
+    # Both staging and temp locations are bad, try to use default bucket.
+    else:
+      default_bucket = self._create_default_gcs_bucket()
+      if default_bucket is None:
+        temp_errors.extend(staging_errors)
+        return temp_errors
+      else:
+        setattr(self, 'temp_location', default_bucket)
+        setattr(self, 'staging_location', default_bucket)
+        self._warn_if_soft_delete_policy_enabled('temp_location')
+        self._warn_if_soft_delete_policy_enabled('staging_location')
+        return []
+
   def validate(self, validator):
     errors = []
     if validator.is_service_runner():
+      errors.extend(self._handle_temp_and_staging_locations(validator))
       errors.extend(validator.validate_cloud_options(self))
-
-      # Validating temp_location, or adding a default if there are issues
-      temp_location_errors = validator.validate_gcs_path(self, 'temp_location')
-      if temp_location_errors:
-        default_bucket = self._create_default_gcs_bucket()
-        if default_bucket is None:
-          errors.extend(temp_location_errors)
-        else:
-          setattr(self, 'temp_location', default_bucket)
-
-      if getattr(self, 'staging_location',
-                 None) or getattr(self, 'temp_location', None) is None:
-        errors.extend(validator.validate_gcs_path(self, 'staging_location'))
 
     if self.view_as(DebugOptions).dataflow_job_file:
       if self.view_as(GoogleCloudOptions).template_location:
@@ -1115,6 +1347,26 @@ class WorkerOptions(PipelineOptions):
         dest='min_cpu_platform',
         type=str,
         help='GCE minimum CPU platform. Default is determined by GCP.')
+    parser.add_argument(
+        '--max_cache_memory_usage_mb',
+        dest='max_cache_memory_usage_mb',
+        type=int,
+        default=0,
+        help=(
+            'Size of the SDK Harness cache to store user state and side '
+            'inputs in MB. The cache is disabled by default. Increasing '
+            'cache size might improve performance of some pipelines, such as '
+            'pipelines that use iterable side input views, but can '
+            'lead to an increase in memory consumption and OOM errors if '
+            'workers are not appropriately provisioned. '
+            'Using the cache might decrease performance pipelines using '
+            'materialized side inputs. '
+            'If the cache is full, least '
+            'recently used elements will be evicted. This cache is per '
+            'each SDK Harness instance. SDK Harness is a component '
+            'responsible for executing the user code and communicating with '
+            'the runner. Depending on the runner, there may be more than one '
+            'SDK Harness process running on the same worker node.'))
 
   def validate(self, validator):
     errors = []
@@ -1491,12 +1743,16 @@ class JobServerOptions(PipelineOptions):
         action='append',
         default=[],
         help='JVM properties to pass to a Java job server.')
+    parser.add_argument(
+        '--jar_cache_dir',
+        default=None,
+        help='The location to store jar cache for job server.')
 
 
 class FlinkRunnerOptions(PipelineOptions):
 
   # These should stay in sync with gradle.properties.
-  PUBLISHED_FLINK_VERSIONS = ['1.12', '1.13', '1.14', '1.15', '1.16']
+  PUBLISHED_FLINK_VERSIONS = ['1.17', '1.18', '1.19']
 
   @classmethod
   def _add_argparse_args(cls, parser):
@@ -1572,6 +1828,24 @@ class SparkRunnerOptions(PipelineOptions):
         help='Spark major version to use.')
 
 
+class PrismRunnerOptions(PipelineOptions):
+  @classmethod
+  def _add_argparse_args(cls, parser):
+    parser.add_argument(
+        '--prism_location',
+        help='Path or URL to a prism binary, or zipped binary for the current '
+        'platform (Operating System and Architecture). May also be an Apache '
+        'Beam Github Release page URL, with a matching beam_version_override '
+        'set. This option overrides all others for finding a prism binary.')
+    parser.add_argument(
+        '--prism_beam_version_override',
+        help=
+        'Override the SDK\'s version for deriving the Github Release URLs for '
+        'downloading a zipped prism binary, for the current platform. If '
+        'prism_location is set to a Github Release page URL, them it will use '
+        'that release page as a base when constructing the download URL.')
+
+
 class TestOptions(PipelineOptions):
   @classmethod
   def _add_argparse_args(cls, parser):
@@ -1635,7 +1909,7 @@ class OptionsContext(object):
 
   Can also be used as a decorator.
   """
-  overrides = []  # type: List[Dict[str, Any]]
+  overrides: List[Dict[str, Any]] = []
 
   def __init__(self, **options):
     self.options = options

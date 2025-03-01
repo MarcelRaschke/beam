@@ -29,8 +29,8 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Matchers.eq;
-import static org.mockito.Matchers.same;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -41,6 +41,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import org.apache.beam.sdk.coders.AtomicCoder;
 import org.apache.beam.sdk.coders.CoderException;
@@ -75,6 +76,7 @@ import org.apache.beam.sdk.transforms.splittabledofn.WatermarkEstimator;
 import org.apache.beam.sdk.transforms.splittabledofn.WatermarkEstimators;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.IntervalWindow;
+import org.apache.beam.sdk.transforms.windowing.PaneInfo;
 import org.apache.beam.sdk.util.UserCodeException;
 import org.joda.time.Instant;
 import org.junit.Before;
@@ -84,7 +86,7 @@ import org.junit.rules.ExpectedException;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import org.mockito.AdditionalAnswers;
-import org.mockito.Matchers;
+import org.mockito.ArgumentMatchers;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
@@ -120,17 +122,19 @@ public class DoFnInvokersTest {
     when(mockArgumentProvider.window()).thenReturn(mockWindow);
     // when(mockArgumentProvider.paneInfo(Matchers.<DoFn>any()))
     //     .thenReturn(mockPaneInfo);
-    when(mockArgumentProvider.element(Matchers.<DoFn>any())).thenReturn(mockElement);
-    when(mockArgumentProvider.timestamp(Matchers.<DoFn>any())).thenReturn(mockTimestamp);
-    when(mockArgumentProvider.outputReceiver(Matchers.<DoFn>any())).thenReturn(mockOutputReceiver);
-    when(mockArgumentProvider.taggedOutputReceiver(Matchers.<DoFn>any()))
+    when(mockArgumentProvider.element(ArgumentMatchers.<DoFn>any())).thenReturn(mockElement);
+    when(mockArgumentProvider.timestamp(ArgumentMatchers.<DoFn>any())).thenReturn(mockTimestamp);
+    when(mockArgumentProvider.outputReceiver(ArgumentMatchers.<DoFn>any()))
+        .thenReturn(mockOutputReceiver);
+    when(mockArgumentProvider.taggedOutputReceiver(ArgumentMatchers.<DoFn>any()))
         .thenReturn(mockMultiOutputReceiver);
     when(mockArgumentProvider.pipelineOptions()).thenReturn(mockOptions);
-    when(mockArgumentProvider.startBundleContext(Matchers.<DoFn>any()))
+    when(mockArgumentProvider.startBundleContext(ArgumentMatchers.<DoFn>any()))
         .thenReturn(mockStartBundleContext);
-    when(mockArgumentProvider.finishBundleContext(Matchers.<DoFn>any()))
+    when(mockArgumentProvider.finishBundleContext(ArgumentMatchers.<DoFn>any()))
         .thenReturn(mockFinishBundleContext);
-    when(mockArgumentProvider.processContext(Matchers.<DoFn>any())).thenReturn(mockProcessContext);
+    when(mockArgumentProvider.processContext(ArgumentMatchers.<DoFn>any()))
+        .thenReturn(mockProcessContext);
   }
 
   private DoFn.ProcessContinuation invokeProcessElement(DoFn<String, String> fn) {
@@ -556,6 +560,15 @@ public class DoFnInvokersTest {
               public void outputWithTimestamp(SomeRestriction output, Instant timestamp) {
                 fail("Unexpected output with timestamp");
               }
+
+              @Override
+              public void outputWindowedValue(
+                  SomeRestriction output,
+                  Instant timestamp,
+                  Collection<? extends BoundedWindow> windows,
+                  PaneInfo paneInfo) {
+                fail("Unexpected outputWindowedValue");
+              }
             };
           }
         });
@@ -796,6 +809,17 @@ public class DoFnInvokersTest {
 
               @Override
               public void outputWithTimestamp(String output, Instant instant) {
+                assertFalse(invoked);
+                invoked = true;
+                assertEquals("foo", output);
+              }
+
+              @Override
+              public void outputWindowedValue(
+                  String output,
+                  Instant timestamp,
+                  Collection<? extends BoundedWindow> windows,
+                  PaneInfo paneInfo) {
                 assertFalse(invoked);
                 invoked = true;
                 assertEquals("foo", output);
