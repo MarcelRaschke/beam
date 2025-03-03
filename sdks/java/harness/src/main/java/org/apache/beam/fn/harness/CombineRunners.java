@@ -24,8 +24,6 @@ import java.util.function.Supplier;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.CombinePayload;
 import org.apache.beam.model.pipeline.v1.RunnerApi.PTransform;
-import org.apache.beam.runners.core.construction.PTransformTranslation;
-import org.apache.beam.runners.core.construction.RehydratedComponents;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.fn.data.FnDataReceiver;
@@ -36,6 +34,8 @@ import org.apache.beam.sdk.transforms.windowing.GlobalWindows;
 import org.apache.beam.sdk.util.SerializableUtils;
 import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.util.WindowedValue.WindowedValueCoder;
+import org.apache.beam.sdk.util.construction.PTransformTranslation;
+import org.apache.beam.sdk.util.construction.RehydratedComponents;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
@@ -137,15 +137,14 @@ public class CombineRunners {
         throws IOException {
       // Get objects needed to create the runner.
       RehydratedComponents rehydratedComponents =
-          RehydratedComponents.forComponents(
-              RunnerApi.Components.newBuilder()
-                  .putAllCoders(context.getCoders())
-                  .putAllWindowingStrategies(context.getWindowingStrategies())
-                  .build());
+          RehydratedComponents.forComponents(context.getComponents());
       String mainInputTag =
           Iterables.getOnlyElement(context.getPTransform().getInputsMap().keySet());
       RunnerApi.PCollection mainInput =
-          context.getPCollections().get(context.getPTransform().getInputsOrThrow(mainInputTag));
+          context
+              .getComponents()
+              .getPcollectionsMap()
+              .get(context.getPTransform().getInputsOrThrow(mainInputTag));
 
       // Input coder may sometimes be WindowedValueCoder depending on runner, instead of the
       // expected KvCoder.

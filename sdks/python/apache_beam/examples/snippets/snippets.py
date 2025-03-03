@@ -890,7 +890,7 @@ def model_bigqueryio(
 
   # [START model_bigqueryio_table_spec]
   # project-id:dataset_id.table_id
-  table_spec = 'clouddataflow-readonly:samples.weather_stations'
+  table_spec = 'apache-beam-testing.samples.weather_stations'
   # [END model_bigqueryio_table_spec]
 
   # [START model_bigqueryio_table_spec_without_project]
@@ -936,7 +936,7 @@ def model_bigqueryio(
       pipeline
       | 'QueryTable' >> beam.io.ReadFromBigQuery(
           query='SELECT max_temperature FROM '\
-                '[clouddataflow-readonly:samples.weather_stations]')
+                '[apache-beam-testing.samples.weather_stations]')
       # Each row is a dictionary where the keys are the BigQuery columns
       | beam.Map(lambda elem: elem['max_temperature']))
   # [END model_bigqueryio_read_query]
@@ -1036,7 +1036,7 @@ def model_bigqueryio_xlang(
   # use a table that does not exist
   import uuid
   never_exists_table = str(uuid.uuid4())
-  table_spec = 'clouddataflow-readonly:samples.{}'.format(never_exists_table)
+  table_spec = 'apache-beam-testing.samples.{}'.format(never_exists_table)
 
   if write_project and write_dataset and write_table:
     table_spec = '{}:{}.{}'.format(write_project, write_dataset, write_table)
@@ -1140,6 +1140,60 @@ def model_multiple_pcollections_flatten(contents, output_path):
         # A list of tuples can be "piped" directly into a Flatten transform.
         | beam.Flatten())
     # [END model_multiple_pcollections_flatten]
+    merged | beam.io.WriteToText(output_path)
+
+
+def model_multiple_pcollections_flatten_with(contents, output_path):
+  """Merging a PCollection with FlattenWith."""
+  some_hash_fn = lambda s: ord(s[0])
+  partition_fn = lambda element, partitions: some_hash_fn(element) % partitions
+  import apache_beam as beam
+  with TestPipeline() as pipeline:  # Use TestPipeline for testing.
+
+    # Partition into deciles
+    partitioned = pipeline | beam.Create(contents) | beam.Partition(
+        partition_fn, 3)
+    pcoll1 = partitioned[0]
+    pcoll2 = partitioned[1]
+    pcoll3 = partitioned[2]
+    SomeTransform = lambda: beam.Map(lambda x: x)
+    SomeOtherTransform = lambda: beam.Map(lambda x: x)
+
+    # Flatten them back into 1
+
+    # A collection of PCollection objects can be represented simply
+    # as a tuple (or list) of PCollections.
+    # (The SDK for Python has no separate type to store multiple
+    # PCollection objects, whether containing the same or different
+    # types.)
+    # [START model_multiple_pcollections_flatten_with]
+    merged = (
+        pcoll1
+        | SomeTransform()
+        | beam.FlattenWith(pcoll2, pcoll3)
+        | SomeOtherTransform())
+    # [END model_multiple_pcollections_flatten_with]
+    merged | beam.io.WriteToText(output_path)
+
+
+def model_multiple_pcollections_flatten_with_transform(contents, output_path):
+  """Merging output of PTransform with FlattenWith."""
+  some_hash_fn = lambda s: ord(s[0])
+  partition_fn = lambda element, partitions: some_hash_fn(element) % partitions
+  import apache_beam as beam
+  with TestPipeline() as pipeline:  # Use TestPipeline for testing.
+
+    pcoll = pipeline | beam.Create(contents)
+    SomeTransform = lambda: beam.Map(lambda x: x)
+    SomeOtherTransform = lambda: beam.Map(lambda x: x)
+
+    # [START model_multiple_pcollections_flatten_with_transform]
+    merged = (
+        pcoll
+        | SomeTransform()
+        | beam.FlattenWith(beam.Create(['x', 'y', 'z']))
+        | SomeOtherTransform())
+    # [END model_multiple_pcollections_flatten_with_transform]
     merged | beam.io.WriteToText(output_path)
 
 

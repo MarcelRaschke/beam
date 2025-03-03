@@ -31,6 +31,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.Pipeline.PipelineVisitor;
 import org.apache.beam.sdk.PipelineRunner;
@@ -359,7 +360,7 @@ public class PAssert {
      *
      * <p>The assertion will concatenate all panes present in the provided window if the {@link
      * Trigger} produces multiple panes. If the windowing strategy accumulates fired panes and
-     * triggers fire multple times, consider using instead {@link #inFinalPane(BoundedWindow)} or
+     * triggers fire multiple times, consider using instead {@link #inFinalPane(BoundedWindow)} or
      * {@link #inOnTimePane(BoundedWindow)}.
      *
      * @return a new {@link SingletonAssert} like this one but with the assertion only applied to
@@ -1610,8 +1611,18 @@ public class PAssert {
 
     @ProcessElement
     public void processElement(ProcessContext c) {
-      ActualT actualContents = Iterables.getOnlyElement(c.element());
-      c.output(doChecks(site, actualContents, checkerFn));
+      try {
+        ActualT actualContents = Iterables.getOnlyElement(c.element());
+        c.output(doChecks(site, actualContents, checkerFn));
+      } catch (NoSuchElementException e) {
+        c.output(
+            SuccessOrFailure.failure(
+                site,
+                new IllegalArgumentException(
+                    "expected singleton PCollection but was: empty PCollection", e)));
+      } catch (IllegalArgumentException e) {
+        c.output(SuccessOrFailure.failure(site, e));
+      }
     }
   }
 

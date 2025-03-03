@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"log/slog"
 	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/coder"
@@ -139,7 +140,7 @@ func groupByType(p *pipepb.Pipeline, minfos []*pipepb.MonitoringInfo) (
 		}
 	}
 	if len(errs) > 0 {
-		log.Printf("Warning: %v errors during metrics processing: %v\n", len(errs), errs)
+		slog.Debug("errors during metrics processing", "count", len(errs), "errors", errs)
 	}
 	return counters, distributions, gauges, msecs, pcols
 }

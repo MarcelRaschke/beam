@@ -26,10 +26,8 @@ file in which users can then compare against the original sentence.
 
 import argparse
 import logging
-from typing import Dict
-from typing import Iterable
-from typing import Iterator
-from typing import Tuple
+from collections.abc import Iterable
+from collections.abc import Iterator
 
 import apache_beam as beam
 import torch
@@ -45,14 +43,14 @@ from transformers import BertForMaskedLM
 from transformers import BertTokenizer
 
 
-def add_mask_to_last_word(text: str) -> Tuple[str, str]:
+def add_mask_to_last_word(text: str) -> tuple[str, str]:
   text_list = text.split()
   return text, ' '.join(text_list[:-2] + ['[MASK]', text_list[-1]])
 
 
 def tokenize_sentence(
-    text_and_mask: Tuple[str, str],
-    bert_tokenizer: BertTokenizer) -> Tuple[str, Dict[str, torch.Tensor]]:
+    text_and_mask: tuple[str, str],
+    bert_tokenizer: BertTokenizer) -> tuple[str, dict[str, torch.Tensor]]:
   text, masked_text = text_and_mask
   tokenized_sentence = bert_tokenizer.encode_plus(
       masked_text, return_tensors="pt")
@@ -84,7 +82,7 @@ class PostProcessor(beam.DoFn):
     super().__init__()
     self.bert_tokenizer = bert_tokenizer
 
-  def process(self, element: Tuple[str, PredictionResult]) -> Iterable[str]:
+  def process(self, element: tuple[str, PredictionResult]) -> Iterable[str]:
     text, prediction_result = element
     inputs = prediction_result.example
     logits = prediction_result.inference['logits']
@@ -118,6 +116,13 @@ def parse_known_args(argv):
       dest='model_state_dict_path',
       required=True,
       help="Path to the model's state_dict.")
+  parser.add_argument(
+      '--large_model',
+      action='store_true',
+      dest='large_model',
+      default=False,
+      help='Set to true if your model is large enough to run into memory '
+      'pressure if you load multiple copies.')
   return parser.parse_known_args(argv)
 
 
@@ -166,7 +171,8 @@ def run(
   model_handler = PytorchNoBatchModelHandler(
       state_dict_path=known_args.model_state_dict_path,
       model_class=model_class,
-      model_params=model_params)
+      model_params=model_params,
+      large_model=known_args.large_model)
 
   pipeline = test_pipeline
   if not test_pipeline:

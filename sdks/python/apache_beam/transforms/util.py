@@ -28,20 +28,24 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Iterable
-from typing import List
-from typing import Tuple
+from typing import Optional
 from typing import TypeVar
 from typing import Union
 
+import apache_beam as beam
 from apache_beam import coders
+from apache_beam import pvalue
 from apache_beam import typehints
 from apache_beam.metrics import Metrics
+from apache_beam.options import pipeline_options
 from apache_beam.portability import common_urns
 from apache_beam.portability.api import beam_runner_api_pb2
 from apache_beam.pvalue import AsSideInput
+from apache_beam.pvalue import PCollection
 from apache_beam.transforms import window
 from apache_beam.transforms.combiners import CountCombineFn
 from apache_beam.transforms.core import CombinePerKey
@@ -61,6 +65,7 @@ from apache_beam.transforms.trigger import AccumulationMode
 from apache_beam.transforms.trigger import Always
 from apache_beam.transforms.userstate import BagStateSpec
 from apache_beam.transforms.userstate import CombiningValueStateSpec
+from apache_beam.transforms.userstate import ReadModifyWriteStateSpec
 from apache_beam.transforms.userstate import TimerSpec
 from apache_beam.transforms.userstate import on_timer
 from apache_beam.transforms.window import NonMergingWindowFn
@@ -68,13 +73,15 @@ from apache_beam.transforms.window import TimestampCombiner
 from apache_beam.transforms.window import TimestampedValue
 from apache_beam.typehints import trivial_inference
 from apache_beam.typehints.decorators import get_signature
+from apache_beam.typehints.native_type_compatibility import TypedWindowedValue
 from apache_beam.typehints.sharded_key_type import ShardedKeyType
+from apache_beam.utils import shared
 from apache_beam.utils import windowed_value
 from apache_beam.utils.annotations import deprecated
 from apache_beam.utils.sharded_key import ShardedKey
+from apache_beam.utils.timestamp import Timestamp
 
 if TYPE_CHECKING:
-  from apache_beam import pvalue
   from apache_beam.runners.pipeline_context import PipelineContext
 
 __all__ = [
@@ -89,6 +96,7 @@ __all__ = [
     'RemoveDuplicates',
     'Reshuffle',
     'ToString',
+    'Tee',
     'Values',
     'WithKeys',
     'GroupIntoBatches'
@@ -97,6 +105,8 @@ __all__ = [
 K = TypeVar('K')
 V = TypeVar('V')
 T = TypeVar('T')
+
+RESHUFFLE_TYPEHINT_BREAKING_CHANGE_VERSION = "2.64.0"
 
 
 class CoGroupByKey(PTransform):
@@ -259,7 +269,7 @@ class _CoGBKImpl(PTransform):
 
 
 @ptransform_fn
-@typehints.with_input_types(Tuple[K, V])
+@typehints.with_input_types(tuple[K, V])
 @typehints.with_output_types(K)
 def Keys(pcoll, label='Keys'):  # pylint: disable=invalid-name
   """Produces a PCollection of first elements of 2-tuples in a PCollection."""
@@ -267,7 +277,7 @@ def Keys(pcoll, label='Keys'):  # pylint: disable=invalid-name
 
 
 @ptransform_fn
-@typehints.with_input_types(Tuple[K, V])
+@typehints.with_input_types(tuple[K, V])
 @typehints.with_output_types(V)
 def Values(pcoll, label='Values'):  # pylint: disable=invalid-name
   """Produces a PCollection of second elements of 2-tuples in a PCollection."""
@@ -275,8 +285,8 @@ def Values(pcoll, label='Values'):  # pylint: disable=invalid-name
 
 
 @ptransform_fn
-@typehints.with_input_types(Tuple[K, V])
-@typehints.with_output_types(Tuple[V, K])
+@typehints.with_input_types(tuple[K, V])
+@typehints.with_output_types(tuple[V, K])
 def KvSwap(pcoll, label='KvSwap'):  # pylint: disable=invalid-name
   """Produces a PCollection reversing 2-tuples in a PCollection."""
   return pcoll | label >> MapTuple(lambda k, v: (v, k))
@@ -392,7 +402,7 @@ class _BatchSizeEstimator(object):
   def record_time(self, batch_size):
     start = self._clock()
     yield
-    elapsed = self._clock() - start
+    elapsed = float(self._clock() - start)
     elapsed_msec = 1e3 * elapsed + self._remainder_msecs
     if self._record_metrics:
       self._size_distribution.update(batch_size)
@@ -576,14 +586,15 @@ class _GlobalWindowsBatchingDoFn(DoFn):
     self._batch_size_estimator.ignore_next_timing()
 
   def process(self, element):
-    self._batch.append(element)
-    self._running_batch_size += self._element_size_fn(element)
-    if self._running_batch_size >= self._target_batch_size:
+    element_size = self._element_size_fn(element)
+    if self._running_batch_size + element_size > self._target_batch_size:
       with self._batch_size_estimator.record_time(self._running_batch_size):
         yield window.GlobalWindows.windowed_value_at_end_of_window(self._batch)
       self._batch = []
       self._running_batch_size = 0
       self._target_batch_size = self._batch_size_estimator.next_batch_size()
+    self._batch.append(element)
+    self._running_batch_size += element_size
 
   def finish_bundle(self):
     if self._batch:
@@ -618,15 +629,18 @@ class _WindowAwareBatchingDoFn(DoFn):
 
   def process(self, element, window=DoFn.WindowParam):
     batch = self._batches[window]
-    batch.elements.append(element)
-    batch.size += self._element_size_fn(element)
-    if batch.size >= self._target_batch_size:
+    element_size = self._element_size_fn(element)
+    if batch.size + element_size > self._target_batch_size:
       with self._batch_size_estimator.record_time(batch.size):
         yield windowed_value.WindowedValue(
             batch.elements, window.max_timestamp(), (window, ))
       del self._batches[window]
       self._target_batch_size = self._batch_size_estimator.next_batch_size()
-    elif len(self._batches) > self._MAX_LIVE_WINDOWS:
+
+    self._batches[window].elements.append(element)
+    self._batches[window].size += element_size
+
+    if len(self._batches) > self._MAX_LIVE_WINDOWS:
       window, batch = max(
           self._batches.items(),
           key=lambda window_batch: window_batch[1].size)
@@ -646,8 +660,135 @@ class _WindowAwareBatchingDoFn(DoFn):
     self._target_batch_size = self._batch_size_estimator.next_batch_size()
 
 
+def _pardo_stateful_batch_elements(
+    input_coder: coders.Coder,
+    batch_size_estimator: _BatchSizeEstimator,
+    max_buffering_duration_secs: int,
+    clock=time.time):
+  ELEMENT_STATE = BagStateSpec('values', input_coder)
+  COUNT_STATE = CombiningValueStateSpec('count', input_coder, CountCombineFn())
+  BATCH_SIZE_STATE = ReadModifyWriteStateSpec('batch_size', input_coder)
+  WINDOW_TIMER = TimerSpec('window_end', TimeDomain.WATERMARK)
+  BUFFERING_TIMER = TimerSpec('buffering_end', TimeDomain.REAL_TIME)
+  BATCH_ESTIMATOR_STATE = ReadModifyWriteStateSpec(
+      'batch_estimator', coders.PickleCoder())
+
+  class _StatefulBatchElementsDoFn(DoFn):
+    def process(
+        self,
+        element,
+        window=DoFn.WindowParam,
+        element_state=DoFn.StateParam(ELEMENT_STATE),
+        count_state=DoFn.StateParam(COUNT_STATE),
+        batch_size_state=DoFn.StateParam(BATCH_SIZE_STATE),
+        batch_estimator_state=DoFn.StateParam(BATCH_ESTIMATOR_STATE),
+        window_timer=DoFn.TimerParam(WINDOW_TIMER),
+        buffering_timer=DoFn.TimerParam(BUFFERING_TIMER)):
+      window_timer.set(window.end)
+      # Drop the fixed key since we don't care about it
+      element_state.add(element[1])
+      count_state.add(1)
+      count = count_state.read()
+      target_size = batch_size_state.read()
+      # Should only happen on the first element
+      if target_size is None:
+        batch_estimator = batch_size_estimator
+        target_size = batch_estimator.next_batch_size()
+        batch_size_state.write(target_size)
+        batch_estimator_state.write(batch_estimator)
+
+      if count == 1 and max_buffering_duration_secs > 0:
+        # First element in batch, start buffering timer
+        buffering_timer.set(clock() + max_buffering_duration_secs)
+
+      if count >= target_size:
+        return self.flush_batch(
+            element_state,
+            count_state,
+            batch_size_state,
+            batch_estimator_state,
+            buffering_timer)
+
+    @on_timer(WINDOW_TIMER)
+    def on_window_timer(
+        self,
+        element_state=DoFn.StateParam(ELEMENT_STATE),
+        count_state=DoFn.StateParam(COUNT_STATE),
+        batch_size_state=DoFn.StateParam(BATCH_SIZE_STATE),
+        batch_estimator_state=DoFn.StateParam(BATCH_ESTIMATOR_STATE),
+        buffering_timer=DoFn.TimerParam(BUFFERING_TIMER)):
+      return self.flush_batch(
+          element_state,
+          count_state,
+          batch_size_state,
+          batch_estimator_state,
+          buffering_timer)
+
+    @on_timer(BUFFERING_TIMER)
+    def on_buffering_timer(
+        self,
+        element_state=DoFn.StateParam(ELEMENT_STATE),
+        count_state=DoFn.StateParam(COUNT_STATE),
+        batch_size_state=DoFn.StateParam(BATCH_SIZE_STATE),
+        batch_estimator_state=DoFn.StateParam(BATCH_ESTIMATOR_STATE),
+        buffering_timer=DoFn.TimerParam(BUFFERING_TIMER)):
+      return self.flush_batch(
+          element_state,
+          count_state,
+          batch_size_state,
+          batch_estimator_state,
+          buffering_timer)
+
+    def flush_batch(
+        self,
+        element_state,
+        count_state,
+        batch_size_state,
+        batch_estimator_state,
+        buffering_timer):
+      batch = [element for element in element_state.read()]
+      if not batch:
+        return
+      element_state.clear()
+      count_state.clear()
+      batch_estimator = batch_estimator_state.read()
+      with batch_estimator.record_time(len(batch)):
+        yield batch
+      batch_size_state.write(batch_estimator.next_batch_size())
+      batch_estimator_state.write(batch_estimator)
+      buffering_timer.clear()
+
+  return _StatefulBatchElementsDoFn()
+
+
+class SharedKey():
+  """A class that holds a per-process UUID used to key elements for streaming
+  BatchElements.
+  """
+  def __init__(self):
+    self.key = uuid.uuid4().hex
+
+
+def load_shared_key():
+  return SharedKey()
+
+
+class WithSharedKey(DoFn):
+  """A DoFn that keys elements with a per-process UUID. Used in streaming
+  BatchElements.
+  """
+  def __init__(self):
+    self.shared_handle = shared.Shared()
+
+  def setup(self):
+    self.key = self.shared_handle.acquire(load_shared_key, "WithSharedKey").key
+
+  def process(self, element):
+    yield (self.key, element)
+
+
 @typehints.with_input_types(T)
-@typehints.with_output_types(List[T])
+@typehints.with_output_types(list[T])
 class BatchElements(PTransform):
   """A Transform that batches elements for amortized processing.
 
@@ -658,7 +799,7 @@ class BatchElements(PTransform):
 
   where the per element cost is (often significantly) smaller than the fixed
   cost and could be amortized over multiple elements.  It consumes a PCollection
-  of element type T and produces a PCollection of element type List[T].
+  of element type T and produces a PCollection of element type list[T].
 
   This transform attempts to find the best batch size between the minimim
   and maximum parameters by profiling the time taken by (fused) downstream
@@ -667,6 +808,20 @@ class BatchElements(PTransform):
   Elements are batched per-window and batches emitted in the window
   corresponding to its contents. Each batch is emitted with a timestamp at
   the end of their window.
+
+  When the max_batch_duration_secs arg is provided, a stateful implementation
+  of BatchElements is used to batch elements across bundles. This is most
+  impactful in streaming applications where many bundles only contain one
+  element. Larger max_batch_duration_secs values `might` reduce the throughput
+  of the transform, while smaller values might improve the throughput but
+  make it more likely that batches are smaller than the target batch size.
+
+  As a general recommendation, start with low values (e.g. 0.005 aka 5ms) and
+  increase as needed to get the desired tradeoff between target batch size
+  and latency or throughput.
+
+  For more information on tuning parameters to this transform, see
+  https://beam.apache.org/documentation/patterns/batch-elements
 
   Args:
     min_batch_size: (optional) the smallest size of a batch
@@ -677,6 +832,9 @@ class BatchElements(PTransform):
         in seconds, excluding fixed cost
     target_batch_duration_secs_including_fixed_cost: (optional) a target for
         total time per bundle, in seconds, including fixed cost
+    max_batch_duration_secs: (optional) the maximum amount of time to buffer
+        a batch before emitting. Setting this argument to be non-none uses the
+        stateful implementation of BatchElements.
     element_size_fn: (optional) A mapping of an element to its contribution to
         batch size, defaulting to every element having size 1.  When provided,
         attempts to provide batches of optimal total size which may consist of
@@ -696,6 +854,7 @@ class BatchElements(PTransform):
       target_batch_overhead=.05,
       target_batch_duration_secs=10,
       target_batch_duration_secs_including_fixed_cost=None,
+      max_batch_duration_secs=None,
       *,
       element_size_fn=lambda x: 1,
       variance=0.25,
@@ -712,10 +871,20 @@ class BatchElements(PTransform):
         clock=clock,
         record_metrics=record_metrics)
     self._element_size_fn = element_size_fn
+    self._max_batch_dur = max_batch_duration_secs
+    self._clock = clock
 
   def expand(self, pcoll):
     if getattr(pcoll.pipeline.runner, 'is_streaming', False):
       raise NotImplementedError("Requires stateful processing (BEAM-2687)")
+    elif self._max_batch_dur is not None:
+      coder = coders.registry.get_coder(pcoll)
+      return pcoll | ParDo(WithSharedKey()) | ParDo(
+          _pardo_stateful_batch_elements(
+              coder,
+              self._batch_size_estimator,
+              self._max_batch_dur,
+              self._clock))
     elif pcoll.windowing.is_default():
       # This is the same logic as _GlobalWindowsBatchingDoFn, but optimized
       # for that simpler case.
@@ -759,8 +928,29 @@ class _IdentityWindowFn(NonMergingWindowFn):
     return self._window_coder
 
 
-@typehints.with_input_types(Tuple[K, V])
-@typehints.with_output_types(Tuple[K, V])
+def is_compat_version_prior_to(options, breaking_change_version):
+  # This function is used in a branch statement to determine whether we should
+  # keep the old behavior prior to a breaking change or use the new behavior.
+  # - If update_compatibility_version < breaking_change_version, we will return
+  #   True and keep the old behavior.
+  # - If update_compatibility_version is None or >= breaking_change_version, we
+  #   will return False and use the behavior from the breaking change.
+  update_compatibility_version = options.view_as(
+      pipeline_options.StreamingOptions).update_compatibility_version
+
+  if update_compatibility_version is None:
+    return False
+
+  compat_version = tuple(map(int, update_compatibility_version.split('.')[0:3]))
+  change_version = tuple(map(int, breaking_change_version.split('.')[0:3]))
+  for i in range(min(len(compat_version), len(change_version))):
+    if compat_version[i] < change_version[i]:
+      return True
+  return False
+
+
+@typehints.with_input_types(tuple[K, V])
+@typehints.with_output_types(tuple[K, V])
 class ReshufflePerKey(PTransform):
   """PTransform that returns a PCollection equivalent to its input,
   but operationally provides some of the side effects of a GroupByKey,
@@ -788,6 +978,14 @@ class ReshufflePerKey(PTransform):
             window.GlobalWindows.windowed_value((key, value), timestamp)
             for (value, timestamp) in values
         ]
+
+      if is_compat_version_prior_to(pcoll.pipeline.options,
+                                    RESHUFFLE_TYPEHINT_BREAKING_CHANGE_VERSION):
+        pre_gbk_map = Map(reify_timestamps).with_output_types(Any)
+      else:
+        pre_gbk_map = Map(reify_timestamps).with_input_types(
+            tuple[K, V]).with_output_types(
+                tuple[K, tuple[V, Optional[Timestamp]]])
     else:
 
       # typing: All conditional function variants must have identical signatures
@@ -801,7 +999,14 @@ class ReshufflePerKey(PTransform):
         key, windowed_values = element
         return [wv.with_value((key, wv.value)) for wv in windowed_values]
 
-    ungrouped = pcoll | Map(reify_timestamps).with_output_types(Any)
+      if is_compat_version_prior_to(pcoll.pipeline.options,
+                                    RESHUFFLE_TYPEHINT_BREAKING_CHANGE_VERSION):
+        pre_gbk_map = Map(reify_timestamps).with_output_types(Any)
+      else:
+        pre_gbk_map = Map(reify_timestamps).with_input_types(
+            tuple[K, V]).with_output_types(tuple[K, TypedWindowedValue[V]])
+
+    ungrouped = pcoll | pre_gbk_map
 
     # TODO(https://github.com/apache/beam/issues/19785) Using global window as
     # one of the standard window. This is to mitigate the Dataflow Java Runner
@@ -849,16 +1054,22 @@ class Reshuffle(PTransform):
 
   def expand(self, pcoll):
     # type: (pvalue.PValue) -> pvalue.PCollection
+    if is_compat_version_prior_to(pcoll.pipeline.options,
+                                  RESHUFFLE_TYPEHINT_BREAKING_CHANGE_VERSION):
+      reshuffle_step = ReshufflePerKey()
+    else:
+      reshuffle_step = ReshufflePerKey().with_input_types(
+          tuple[int, T]).with_output_types(tuple[int, T])
     return (
         pcoll | 'AddRandomKeys' >>
         Map(lambda t: (random.randrange(0, self.num_buckets), t)
-            ).with_input_types(T).with_output_types(Tuple[int, T])
-        | ReshufflePerKey()
+            ).with_input_types(T).with_output_types(tuple[int, T])
+        | reshuffle_step
         | 'RemoveRandomKeys' >> Map(lambda t: t[1]).with_input_types(
-            Tuple[int, T]).with_output_types(T))
+            tuple[int, T]).with_output_types(T))
 
   def to_runner_api_parameter(self, unused_context):
-    # type: (PipelineContext) -> Tuple[str, None]
+    # type: (PipelineContext) -> tuple[str, None]
     return common_urns.composites.RESHUFFLE.urn, None
 
   @staticmethod
@@ -907,8 +1118,8 @@ def WithKeys(pcoll, k, *args, **kwargs):
   return pcoll | Map(lambda v: (k, v))
 
 
-@typehints.with_input_types(Tuple[K, V])
-@typehints.with_output_types(Tuple[K, Iterable[V]])
+@typehints.with_input_types(tuple[K, V])
+@typehints.with_output_types(tuple[K, Iterable[V]])
 class GroupIntoBatches(PTransform):
   """PTransform that batches the input into desired batch size. Elements are
   buffered until they are equal to batch size provided in the argument at which
@@ -945,7 +1156,7 @@ class GroupIntoBatches(PTransform):
   def to_runner_api_parameter(
       self,
       unused_context  # type: PipelineContext
-  ):  # type: (...) -> Tuple[str, beam_runner_api_pb2.GroupIntoBatchesPayload]
+  ):  # type: (...) -> tuple[str, beam_runner_api_pb2.GroupIntoBatchesPayload]
     return (
         common_urns.group_into_batches_components.GROUP_INTO_BATCHES.urn,
         self.params.get_payload())
@@ -957,7 +1168,7 @@ class GroupIntoBatches(PTransform):
   def from_runner_api_parameter(unused_ptransform, proto, unused_context):
     return GroupIntoBatches(*_GroupIntoBatchesParams.parse_payload(proto))
 
-  @typehints.with_input_types(Tuple[K, V])
+  @typehints.with_input_types(tuple[K, V])
   @typehints.with_output_types(
       typehints.Tuple[
           ShardedKeyType[typehints.TypeVariable(K)],  # type: ignore[misc]
@@ -1005,7 +1216,7 @@ class GroupIntoBatches(PTransform):
     def to_runner_api_parameter(
         self,
         unused_context  # type: PipelineContext
-    ):  # type: (...) -> Tuple[str, beam_runner_api_pb2.GroupIntoBatchesPayload]
+    ):  # type: (...) -> tuple[str, beam_runner_api_pb2.GroupIntoBatchesPayload]
       return (
           common_urns.composites.GROUP_INTO_BATCHES_WITH_SHARDED_KEY.urn,
           self.params.get_payload())
@@ -1155,13 +1366,24 @@ class ToString(object):
 class LogElements(PTransform):
   """
   PTransform for printing the elements of a PCollection.
+
+  Args:
+    label (str): (optional) A custom label for the transform.
+    prefix (str): (optional) A prefix string to prepend to each logged element.
+    with_timestamp (bool): (optional) Whether to include element's timestamp.
+    with_window (bool): (optional) Whether to include element's window.
+    level: (optional) The logging level for the output (e.g. `logging.DEBUG`,
+        `logging.INFO`, `logging.WARNING`, `logging.ERROR`). If not specified,
+        the log is printed to stdout.
   """
   class _LoggingFn(DoFn):
-    def __init__(self, prefix='', with_timestamp=False, with_window=False):
+    def __init__(
+        self, prefix='', with_timestamp=False, with_window=False, level=None):
       super().__init__()
       self.prefix = prefix
       self.with_timestamp = with_timestamp
       self.with_window = with_window
+      self.level = level
 
     def process(
         self,
@@ -1178,19 +1400,38 @@ class LogElements(PTransform):
         log_line += ', window(start=' + window.start.to_rfc3339()
         log_line += ', end=' + window.end.to_rfc3339() + ')'
 
-      print(log_line)
+      if self.level == logging.DEBUG:
+        logging.debug(log_line)
+      elif self.level == logging.INFO:
+        logging.info(log_line)
+      elif self.level == logging.WARNING:
+        logging.warning(log_line)
+      elif self.level == logging.ERROR:
+        logging.error(log_line)
+      elif self.level == logging.CRITICAL:
+        logging.critical(log_line)
+      else:
+        print(log_line)
+
       yield element
 
   def __init__(
-      self, label=None, prefix='', with_timestamp=False, with_window=False):
+      self,
+      label=None,
+      prefix='',
+      with_timestamp=False,
+      with_window=False,
+      level=None):
     super().__init__(label)
     self.prefix = prefix
     self.with_timestamp = with_timestamp
     self.with_window = with_window
+    self.level = level
 
   def expand(self, input):
     return input | ParDo(
-        self._LoggingFn(self.prefix, self.with_timestamp, self.with_window))
+        self._LoggingFn(
+            self.prefix, self.with_timestamp, self.with_window, self.level))
 
 
 class Reify(object):
@@ -1222,8 +1463,8 @@ class Reify(object):
     def expand(self, pcoll):
       return pcoll | ParDo(self.add_window_info)
 
-  @typehints.with_input_types(Tuple[K, V])
-  @typehints.with_output_types(Tuple[K, V])
+  @typehints.with_input_types(tuple[K, V])
+  @typehints.with_output_types(tuple[K, V])
   class TimestampInValue(PTransform):
     """PTransform to wrap the Value in a KV pair in a TimestampedValue with
     the element's associated timestamp."""
@@ -1235,8 +1476,8 @@ class Reify(object):
     def expand(self, pcoll):
       return pcoll | ParDo(self.add_timestamp_info)
 
-  @typehints.with_input_types(Tuple[K, V])
-  @typehints.with_output_types(Tuple[K, V])
+  @typehints.with_input_types(tuple[K, V])
+  @typehints.with_output_types(tuple[K, V])
   class WindowInValue(PTransform):
     """PTransform to convert the Value in a KV pair into a tuple of
     (value, timestamp, window), with the whole element being wrapped inside a
@@ -1295,7 +1536,7 @@ class Regex(object):
 
   @staticmethod
   @typehints.with_input_types(str)
-  @typehints.with_output_types(List[str])
+  @typehints.with_output_types(list[str])
   @ptransform_fn
   def all_matches(pcoll, regex):
     """
@@ -1316,7 +1557,7 @@ class Regex(object):
 
   @staticmethod
   @typehints.with_input_types(str)
-  @typehints.with_output_types(Tuple[str, str])
+  @typehints.with_output_types(tuple[str, str])
   @ptransform_fn
   def matches_kv(pcoll, regex, keyGroup, valueGroup=0):
     """
@@ -1363,7 +1604,7 @@ class Regex(object):
 
   @staticmethod
   @typehints.with_input_types(str)
-  @typehints.with_output_types(Union[List[str], List[Tuple[str, str]]])
+  @typehints.with_output_types(Union[list[str], list[tuple[str, str]]])
   @ptransform_fn
   def find_all(pcoll, regex, group=0, outputEmpty=True):
     """
@@ -1392,7 +1633,7 @@ class Regex(object):
 
   @staticmethod
   @typehints.with_input_types(str)
-  @typehints.with_output_types(Tuple[str, str])
+  @typehints.with_output_types(tuple[str, str])
   @ptransform_fn
   def find_kv(pcoll, regex, keyGroup, valueGroup=0):
     """
@@ -1449,7 +1690,7 @@ class Regex(object):
 
   @staticmethod
   @typehints.with_input_types(str)
-  @typehints.with_output_types(List[str])
+  @typehints.with_output_types(list[str])
   @ptransform_fn
   def split(pcoll, regex, outputEmpty=False):
     """
@@ -1471,3 +1712,69 @@ class Regex(object):
       yield r
 
     return pcoll | FlatMap(_process)
+
+
+@typehints.with_input_types(T)
+@typehints.with_output_types(T)
+class Tee(PTransform):
+  """A PTransform that returns its input, but also applies its input elsewhere.
+
+ Similar to the shell {@code tee} command. This can be useful to write out or
+ otherwise process an intermediate transform without breaking the linear flow
+ of a chain of transforms, e.g.::
+
+     (input
+         | SomePTransform()
+         | ...
+         | Tee(SomeSideTransform())
+         | ...)
+  """
+  def __init__(
+      self,
+      *consumers: Union[PTransform[PCollection[T], Any],
+                        Callable[[PCollection[T]], Any]]):
+    self._consumers = consumers
+
+  def expand(self, input):
+    for consumer in self._consumers:
+      if callable(consumer):
+        _ = input | ptransform_fn(consumer)()
+      else:
+        _ = input | consumer
+    return input
+
+
+@typehints.with_input_types(T)
+@typehints.with_output_types(T)
+class WaitOn(PTransform):
+  """Delays processing of a {@link PCollection} until another set of
+  PCollections has finished being processed. For example::
+
+     X | WaitOn(Y, Z) | SomeTransform()
+
+  would ensure that PCollections Y and Z (and hence their producing transforms)
+  are complete before SomeTransform gets executed on the elements of X.
+  This can be especially useful the waited-on PCollections are the outputs
+  of transforms that interact with external systems (such as writing to a
+  database or other sink).
+
+  For streaming, this delay is done on a per-window basis, i.e.
+  the corresponding window of each waited-on PCollection is computed before
+  elements are passed through the main collection.
+
+  This barrier often induces a fusion break.
+  """
+  def __init__(self, *to_be_waited_on):
+    self._to_be_waited_on = to_be_waited_on
+
+  def expand(self, pcoll):
+    # All we care about is the watermark, not the data itself.
+    # The GroupByKey avoids writing empty files for each shard, and also
+    # ensures the respective window finishes before advancing the timestamp.
+    sides = [
+        pvalue.AsIter(
+            side
+            | f"WaitOn{ix}" >> (beam.FlatMap(lambda x: ()) | GroupByKey()))
+        for (ix, side) in enumerate(self._to_be_waited_on)
+    ]
+    return pcoll | beam.Map(lambda x, *unused_sides: x, *sides)

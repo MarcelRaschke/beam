@@ -91,13 +91,22 @@ public class FlinkPipelineOptionsTest {
     assertThat(options.getStateBackendFactory(), is(nullValue()));
     assertThat(options.getStateBackend(), is(nullValue()));
     assertThat(options.getStateBackendStoragePath(), is(nullValue()));
-    assertThat(options.getMaxBundleSize(), is(1000L));
-    assertThat(options.getMaxBundleTimeMills(), is(1000L));
     assertThat(options.getExecutionModeForBatch(), is(ExecutionMode.PIPELINED.name()));
+    assertThat(options.getUseDataStreamForBatch(), is(false));
     assertThat(options.getSavepointPath(), is(nullValue()));
     assertThat(options.getAllowNonRestoredState(), is(false));
     assertThat(options.getDisableMetrics(), is(false));
     assertThat(options.getFasterCopy(), is(false));
+
+    assertThat(options.isStreaming(), is(false));
+    assertThat(options.getMaxBundleSize(), is(5000L));
+    assertThat(options.getMaxBundleTimeMills(), is(10000L));
+
+    // In streaming mode bundle size and bundle time are shorter
+    FlinkPipelineOptions optionsStreaming = FlinkPipelineOptions.defaults();
+    optionsStreaming.setStreaming(true);
+    assertThat(optionsStreaming.getMaxBundleSize(), is(1000L));
+    assertThat(optionsStreaming.getMaxBundleTimeMills(), is(1000L));
   }
 
   @Test(expected = Exception.class)
@@ -130,7 +139,7 @@ public class FlinkPipelineOptionsTest {
     TupleTag<String> mainTag = new TupleTag<>("main-output");
 
     Coder<WindowedValue<String>> coder = WindowedValue.getValueOnlyCoder(StringUtf8Coder.of());
-    DoFnOperator<String, String> doFnOperator =
+    DoFnOperator<String, String, String> doFnOperator =
         new DoFnOperator<>(
             new TestDoFn(),
             "stepName",
@@ -152,7 +161,7 @@ public class FlinkPipelineOptionsTest {
     final byte[] serialized = SerializationUtils.serialize(doFnOperator);
 
     @SuppressWarnings("unchecked")
-    DoFnOperator<Object, Object> deserialized = SerializationUtils.deserialize(serialized);
+    DoFnOperator<Object, Object, Object> deserialized = SerializationUtils.deserialize(serialized);
 
     TypeInformation<WindowedValue<Object>> typeInformation =
         TypeInformation.of(new TypeHint<WindowedValue<Object>>() {});

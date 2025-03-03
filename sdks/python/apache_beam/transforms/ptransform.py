@@ -37,25 +37,25 @@ FlatMap processing functions.
 # pytype: skip-file
 
 import copy
+import functools
+import inspect
 import itertools
+import json
 import logging
 import operator
 import os
 import sys
 import threading
+import warnings
+from collections.abc import Callable
+from collections.abc import Mapping
+from collections.abc import Sequence
 from functools import reduce
 from functools import wraps
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
-from typing import Dict
 from typing import Generic
-from typing import List
-from typing import Mapping
 from typing import Optional
-from typing import Sequence
-from typing import Tuple
-from typing import Type
 from typing import TypeVar
 from typing import Union
 from typing import overload
@@ -83,6 +83,7 @@ from apache_beam.typehints.decorators import getcallargs_forhints
 from apache_beam.typehints.trivial_inference import instance_to_type
 from apache_beam.typehints.typehints import validate_composite_type_param
 from apache_beam.utils import proto_utils
+from apache_beam.utils import python_callable
 
 if TYPE_CHECKING:
   from apache_beam import coders
@@ -95,6 +96,7 @@ __all__ = [
     'PTransform',
     'ptransform_fn',
     'label_from_callable',
+    'annotate_yaml',
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -143,7 +145,7 @@ class _SetInputPValues(_PValueishTransform):
 # in-process, in eager mode.  This cache allows the same _MaterializedResult
 # object to be accessed and used despite Runner API round-trip serialization.
 _pipeline_materialization_cache = {
-}  # type: Dict[Tuple[int, int], Dict[int, _MaterializedResult]]
+}  # type: dict[tuple[int, int], dict[int, _MaterializedResult]]
 _pipeline_materialization_lock = threading.Lock()
 
 
@@ -194,7 +196,7 @@ class _MaterializedResult(object):
     # type: (int, int) -> None
     self._pipeline_id = pipeline_id
     self._result_id = result_id
-    self.elements = []  # type: List[Any]
+    self.elements = []  # type: list[Any]
 
   def __reduce__(self):
     # When unpickled (during Runner API roundtrip serailization), get the
@@ -370,8 +372,11 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
     # type: () -> str
     return self.__class__.__name__
 
-  def annotations(self) -> Dict[str, Union[bytes, str, message.Message]]:
-    return {}
+  def annotations(self) -> dict[str, Union[bytes, str, message.Message]]:
+    return {
+        'python_type':  #
+        f'{self.__class__.__module__}.{self.__class__.__qualname__}'
+    }
 
   def default_type_hints(self):
     fn_type_hints = IOTypeHints.from_callable(self.expand)
@@ -449,11 +454,11 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
     return self
 
   def get_resource_hints(self):
-    # type: () -> Dict[str, bytes]
+    # type: () -> dict[str, bytes]
     if '_resource_hints' not in self.__dict__:
       # PTransform subclasses don't always call super(), so prefer lazy
       # initialization. By default, transforms don't have any resource hints.
-      self._resource_hints = {}  # type: Dict[str, bytes]
+      self._resource_hints = {}  # type: dict[str, bytes]
     return self._resource_hints
 
   def type_check_inputs(self, pvalueish):
@@ -488,13 +493,12 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
         at_context = ' %s %s' % (input_or_output, context) if context else ''
         raise TypeCheckError(
             '{type} type hint violation at {label}{context}: expected {hint}, '
-            'got {actual_type}\nFull type hint:\n{debug_str}'.format(
+            'got {actual_type}'.format(
                 type=input_or_output.title(),
                 label=self.label,
                 context=at_context,
                 hint=hint,
-                actual_type=pvalue_.element_type,
-                debug_str=type_hints.debug_str()))
+                actual_type=pvalue_.element_type))
 
   def _infer_output_coder(self, input_type=None, input_coder=None):
     # type: (...) -> Optional[coders.Coder]
@@ -649,7 +653,7 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
       return input_dict
 
   def _named_inputs(self, main_inputs, side_inputs):
-    # type: (Mapping[str, pvalue.PValue], Sequence[Any]) -> Dict[str, pvalue.PValue]
+    # type: (Mapping[str, pvalue.PValue], Sequence[Any]) -> dict[str, pvalue.PValue]
 
     """Returns the dictionary of named inputs (including side inputs) as they
     should be named in the beam proto.
@@ -664,7 +668,7 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
     return dict(main_inputs, **named_side_inputs)
 
   def _named_outputs(self, outputs):
-    # type: (Dict[object, pvalue.PCollection]) -> Dict[str, pvalue.PCollection]
+    # type: (dict[object, pvalue.PCollection]) -> dict[str, pvalue.PCollection]
 
     """Returns the dictionary of named outputs as they should be named in the
     beam proto.
@@ -676,14 +680,14 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
         if isinstance(output, pvalue.PCollection)
     }
 
-  _known_urns = {}  # type: Dict[str, Tuple[Optional[type], ConstructorFn]]
+  _known_urns = {}  # type: dict[str, tuple[Optional[type], ConstructorFn]]
 
   @classmethod
   @overload
   def register_urn(
       cls,
       urn,  # type: str
-      parameter_type,  # type: Type[T]
+      parameter_type,  # type: type[T]
   ):
     # type: (...) -> Callable[[Union[type, Callable[[beam_runner_api_pb2.PTransform, T, PipelineContext], Any]]], Callable[[T, PipelineContext], Any]]
     pass
@@ -702,7 +706,7 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
   @overload
   def register_urn(cls,
                    urn,  # type: str
-                   parameter_type,  # type: Type[T]
+                   parameter_type,  # type: type[T]
                    constructor  # type: Callable[[beam_runner_api_pb2.PTransform, T, PipelineContext], Any]
                   ):
     # type: (...) -> None
@@ -739,7 +743,7 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
     # type: (PipelineContext, bool, Any) -> beam_runner_api_pb2.FunctionSpec
     from apache_beam.portability.api import beam_runner_api_pb2
     # typing: only ParDo supports extra_kwargs
-    urn, typed_param = self.to_runner_api_parameter(context, **extra_kwargs)  # type: ignore[call-arg]
+    urn, typed_param = self.to_runner_api_parameter(context, **extra_kwargs)
     if urn == python_urns.GENERIC_COMPOSITE_TRANSFORM and not has_parts:
       # TODO(https://github.com/apache/beam/issues/18713): Remove this fallback.
       urn, typed_param = self.to_runner_api_pickled(context)
@@ -768,21 +772,21 @@ class PTransform(WithTypeHints, HasDisplayData, Generic[InputT, OutputT]):
       self,
       unused_context  # type: PipelineContext
   ):
-    # type: (...) -> Tuple[str, Optional[Union[message.Message, bytes, str]]]
+    # type: (...) -> tuple[str, Optional[Union[message.Message, bytes, str]]]
     # The payload here is just to ease debugging.
     return (
         python_urns.GENERIC_COMPOSITE_TRANSFORM,
         getattr(self, '_fn_api_payload', str(self)))
 
   def to_runner_api_pickled(self, unused_context):
-    # type: (PipelineContext) -> Tuple[str, bytes]
+    # type: (PipelineContext) -> tuple[str, bytes]
     return (python_urns.PICKLED_TRANSFORM, pickler.dumps(self))
 
   def runner_api_requires_keyed_input(self):
     return False
 
   def _add_type_constraint_from_consumer(self, full_label, input_type_hints):
-    # type: (str, Tuple[str, Any]) -> None
+    # type: (str, tuple[str, Any]) -> None
 
     """Adds a consumer transform's input type hints to our output type
     constraints, which is used during performance runtime type-checking.
@@ -930,7 +934,25 @@ class PTransformWithSideInputs(PTransform):
       bindings = getcallargs_forhints(argspec_fn, *arg_types, **kwargs_types)
       hints = getcallargs_forhints(
           argspec_fn, *input_types[0], **input_types[1])
-      for arg, hint in hints.items():
+
+      # First check the main input.
+      arg_hints = iter(hints.items())
+      element_arg, element_hint = next(arg_hints)
+      if not typehints.is_consistent_with(
+          bindings.get(element_arg, typehints.Any), element_hint):
+        transform_nest_level = self.label.count("/")
+        split_producer_label = pvalueish.producer.full_label.split("/")
+        producer_label = "/".join(
+            split_producer_label[:transform_nest_level + 1])
+        raise TypeCheckError(
+            f"The transform '{self.label}' requires "
+            f"PCollections of type '{element_hint}' "
+            f"but was applied to a PCollection of type"
+            f" '{bindings[element_arg]}' "
+            f"(produced by the transform '{producer_label}'). ")
+
+      # Now check the side inputs.
+      for arg, hint in arg_hints:
         if arg.startswith('__unknown__'):
           continue
         if hint is None:
@@ -1069,6 +1091,15 @@ def ptransform_fn(fn):
           'type hints for %s: %s', res.default_label(), res.get_type_hints())
     return res
 
+  # The signature of this PTransform constructor is that of fn minus the first
+  # argument (which is where the pvalue is passed during expand).
+  try:
+    callable_ptransform_factory.__signature__ = inspect.signature(  # type: ignore
+        functools.partial(fn, None))
+  except Exception:
+    # Sometimes we can't get the original signature.
+    pass
+
   return callable_ptransform_factory
 
 
@@ -1093,3 +1124,79 @@ class _NamedPTransform(PTransform):
 
   def expand(self, pvalue):
     raise RuntimeError("Should never be expanded directly.")
+
+  def annotations(self):
+    return self.transform.annotations()
+
+  def __rrshift__(self, label):
+    return _NamedPTransform(self.transform, label)
+
+  def __getattr__(self, attr):
+    transform_attr = getattr(self.transform, attr)
+    if callable(transform_attr):
+
+      @wraps(transform_attr)
+      def wrapper(*args, **kwargs):
+        result = transform_attr(*args, **kwargs)
+        if isinstance(result, PTransform):
+          return _NamedPTransform(result, self.label)
+        else:
+          return result
+
+      return wrapper
+    else:
+      return transform_attr
+
+  def __setattr__(self, attr, value):
+    if attr == 'annotations':
+      self.transform.annotations = value
+    else:
+      super().__setattr__(attr, value)
+
+
+# Defined here to avoid circular import issues for Beam library transforms.
+def annotate_yaml(constructor):
+  """Causes instances of this transform to be annotated with their yaml syntax.
+
+  Should only be used for transforms that are fully defined by their constructor
+  arguments.
+  """
+  @wraps(constructor)
+  def wrapper(*args, **kwargs):
+    transform = constructor(*args, **kwargs)
+
+    fully_qualified_name = (
+        f'{constructor.__module__}.{constructor.__qualname__}')
+    try:
+      imported_constructor = (
+          python_callable.PythonCallableWithSource.
+          load_from_fully_qualified_name(fully_qualified_name))
+      if imported_constructor != wrapper:
+        raise ImportError('Different object.')
+    except ImportError:
+      warnings.warn(f'Cannot import {constructor} as {fully_qualified_name}.')
+      return transform
+
+    try:
+      config = json.dumps({
+          'constructor': fully_qualified_name,
+          'args': args,
+          'kwargs': kwargs,
+      })
+    except TypeError as exn:
+      warnings.warn(
+          f'Cannot serialize arguments for {constructor} as json: {exn}')
+      return transform
+
+    original_annotations = transform.annotations
+    transform.annotations = lambda: {
+        **original_annotations(),
+        # These override whatever may have been provided earlier.
+        # The outermost call is expected to be the most specific.
+        'yaml_provider': 'python',
+        'yaml_type': 'PyTransform',
+        'yaml_args': config,
+    }
+    return transform
+
+  return wrapper

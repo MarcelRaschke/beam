@@ -19,10 +19,13 @@ package org.apache.beam.it.neo4j;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.AdditionalMatchers.and;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.endsWith;
 import static org.mockito.ArgumentMatchers.startsWith;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -68,6 +71,7 @@ public class Neo4jResourceManagerTest {
     when(container.getMappedPort(NEO4J_BOLT_PORT)).thenReturn(MAPPED_PORT);
     when(session.run(anyString(), anyMap())).thenReturn(result);
     when(neo4jDriver.session(any())).thenReturn(session);
+    doReturn(container).when(container).withLogConsumer(any());
 
     testManager =
         new Neo4jResourceManager(neo4jDriver, container, Neo4jResourceManager.builder(TEST_ID));
@@ -87,6 +91,16 @@ public class Neo4jResourceManagerTest {
   }
 
   @Test
+  public void testDatabaseIsCreatedWithNoWaitOptions() {
+    Neo4jResourceManager.Builder builder =
+        Neo4jResourceManager.builder(TEST_ID)
+            .setDatabaseName(STATIC_DATABASE_NAME, DatabaseWaitOptions.noWaitDatabase());
+    new Neo4jResourceManager(neo4jDriver, container, builder);
+
+    verify(session).run(and(startsWith("CREATE DATABASE"), endsWith("NOWAIT")), anyMap());
+  }
+
+  @Test
   public void testGetUriShouldReturnCorrectValue() {
     assertThat(testManager.getUri()).matches("neo4j://" + HOST + ":" + MAPPED_PORT);
   }
@@ -101,7 +115,8 @@ public class Neo4jResourceManagerTest {
     doThrow(ClientException.class).when(session).run(anyString(), anyMap());
 
     assertThrows(
-        Neo4jResourceManagerException.class, () -> testManager.dropDatabase(STATIC_DATABASE_NAME));
+        Neo4jResourceManagerException.class,
+        () -> testManager.dropDatabase(STATIC_DATABASE_NAME, DatabaseWaitOptions.noWaitDatabase()));
   }
 
   @Test

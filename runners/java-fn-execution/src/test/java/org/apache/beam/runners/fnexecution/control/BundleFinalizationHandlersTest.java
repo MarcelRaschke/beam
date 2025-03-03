@@ -19,29 +19,33 @@ package org.apache.beam.runners.fnexecution.control;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyZeroInteractions;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.FinalizeBundleRequest;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi.InstructionRequest;
 import org.apache.beam.runners.fnexecution.control.BundleFinalizationHandlers.InMemoryFinalizer;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 /** Tests for {@link BundleFinalizationHandlers}. */
 @RunWith(JUnit4.class)
 public class BundleFinalizationHandlersTest {
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(600);
+
   @Test
   public void testInMemoryFinalizer() {
     InstructionRequestHandler mockHandler = mock(InstructionRequestHandler.class);
     InMemoryFinalizer finalizer = BundleFinalizationHandlers.inMemoryFinalizer(mockHandler);
 
     finalizer.finalizeAllOutstandingBundles();
-    verifyZeroInteractions(mockHandler);
+    verifyNoInteractions(mockHandler);
 
     finalizer.requestsFinalization("A");
     finalizer.requestsFinalization("B");
-    verifyZeroInteractions(mockHandler);
+    verifyNoInteractions(mockHandler);
 
     finalizer.finalizeAllOutstandingBundles();
     verify(mockHandler).handle(requestFor("A"));

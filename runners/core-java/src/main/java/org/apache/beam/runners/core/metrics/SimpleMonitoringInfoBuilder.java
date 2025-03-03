@@ -18,11 +18,13 @@
 package org.apache.beam.runners.core.metrics;
 
 import static org.apache.beam.model.pipeline.v1.MetricsApi.monitoringInfoSpec;
+import static org.apache.beam.runners.core.metrics.MonitoringInfoEncodings.encodeBoundedTrie;
 import static org.apache.beam.runners.core.metrics.MonitoringInfoEncodings.encodeDoubleCounter;
 import static org.apache.beam.runners.core.metrics.MonitoringInfoEncodings.encodeDoubleDistribution;
 import static org.apache.beam.runners.core.metrics.MonitoringInfoEncodings.encodeInt64Counter;
 import static org.apache.beam.runners.core.metrics.MonitoringInfoEncodings.encodeInt64Distribution;
 import static org.apache.beam.runners.core.metrics.MonitoringInfoEncodings.encodeInt64Gauge;
+import static org.apache.beam.runners.core.metrics.MonitoringInfoEncodings.encodeStringSet;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import java.util.HashMap;
@@ -145,6 +147,26 @@ public class SimpleMonitoringInfoBuilder {
       long count, double sum, double min, double max) {
     this.builder.setPayload(encodeDoubleDistribution(count, sum, min, max));
     this.builder.setType(MonitoringInfoConstants.TypeUrns.DISTRIBUTION_DOUBLE_TYPE);
+    return this;
+  }
+
+  /**
+   * Encodes the value and sets the type to {@link
+   * MonitoringInfoConstants.TypeUrns#SET_STRING_TYPE}.
+   */
+  public SimpleMonitoringInfoBuilder setStringSetValue(StringSetData value) {
+    this.builder.setPayload(encodeStringSet(value));
+    this.builder.setType(MonitoringInfoConstants.TypeUrns.SET_STRING_TYPE);
+    return this;
+  }
+
+  /**
+   * Encodes the value and sets the type to {@link
+   * MonitoringInfoConstants.TypeUrns#BOUNDED_TRIE_TYPE}.
+   */
+  public SimpleMonitoringInfoBuilder setBoundedTrieValue(BoundedTrieData value) {
+    this.builder.setPayload(encodeBoundedTrie(value));
+    this.builder.setType(MonitoringInfoConstants.TypeUrns.BOUNDED_TRIE_TYPE);
     return this;
   }
 

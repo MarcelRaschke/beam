@@ -22,12 +22,18 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/metrics"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/metricsx"
@@ -35,9 +41,13 @@ import (
 	jobpb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/jobmanagement_v1"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
 	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slog"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	kApplicationJson = "application/json"
+	kContentType     = "Content-Type"
 )
 
 //go:embed index.html
@@ -46,12 +56,16 @@ var indexTemplate string
 //go:embed jobdetails.html
 var jobTemplate string
 
+//go:embed debugz.html
+var debugzTemplate string
+
 //go:embed assets/*
 var assets embed.FS
 
 var (
-	indexPage = template.Must(template.New("index").Parse(indexTemplate))
-	jobPage   = template.Must(template.New("job").Parse(jobTemplate))
+	indexPage  = template.Must(template.New("index").Parse(indexTemplate))
+	jobPage    = template.Must(template.New("job").Parse(jobTemplate))
+	debugzPage = template.Must(template.New("debugz").Parse(debugzTemplate))
 )
 
 type pTransform struct {
@@ -184,6 +198,10 @@ func (h *jobDetailsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	trs := pipeResp.GetPipeline().GetComponents().GetTransforms()
 	col2T, topo := preprocessTransforms(trs)
 
+	counters := toTransformMap(results.AllMetrics().Counters())
+	distributions := toTransformMap(results.AllMetrics().Distributions())
+	msecs := toTransformMap(results.AllMetrics().Msecs())
+
 	data.Transforms = make([]pTransform, 0, len(trs))
 	for _, id := range topo {
 		pt := trs[id]
@@ -220,6 +238,38 @@ func (h *jobDetailsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			strMets = append(strMets, outMets...)
 		}
 
+		var msecMets []string
+		// TODO: Figure out where uniquename or id is being used in prism. It should be all global transform ID to faciliate lookups.
+		for _, msec := range msecs[id] {
+			msecMets = append(msecMets, fmt.Sprintf("\n- %+v", msec.Result()))
+		}
+		for _, msec := range msecs[pt.GetUniqueName()] {
+			msecMets = append(msecMets, fmt.Sprintf("\n- %+v", msec.Result()))
+		}
+		if len(msecMets) > 0 {
+			strMets = append(strMets, "Profiling metrics")
+			strMets = append(strMets, msecMets...)
+		}
+
+		var userMetrics []string
+		for _, ctr := range counters[id] {
+			userMetrics = append(userMetrics, fmt.Sprintf("\n- %s.%s: %v", ctr.Namespace(), ctr.Name(), ctr.Result()))
+		}
+		for _, dist := range distributions[id] {
+			userMetrics = append(userMetrics, fmt.Sprintf("\n- %s.%s: %+v", dist.Namespace(), dist.Name(), dist.Result()))
+		}
+		for _, ctr := range counters[pt.GetUniqueName()] {
+			userMetrics = append(userMetrics, fmt.Sprintf("\n- %s.%s: %v", ctr.Namespace(), ctr.Name(), ctr.Result()))
+		}
+		for _, dist := range distributions[pt.GetUniqueName()] {
+			userMetrics = append(userMetrics, fmt.Sprintf("\n- %s.%s: %+v", dist.Namespace(), dist.Name(), dist.Result()))
+		}
+
+		if len(userMetrics) > 0 {
+			strMets = append(strMets, "User metrics")
+			strMets = append(strMets, userMetrics...)
+		}
+
 		data.Transforms = append(data.Transforms, pTransform{
 			ID:        id,
 			Transform: pt,
@@ -228,6 +278,14 @@ func (h *jobDetailsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	renderPage(jobPage, &data, w)
+}
+
+func toTransformMap[E interface{ Transform() string }](mets []E) map[string][]E {
+	ret := map[string][]E{}
+	for _, met := range mets {
+		ret[met.Transform()] = append(ret[met.Transform()], met)
+	}
+	return ret
 }
 
 type pcolParent struct {
@@ -240,7 +298,10 @@ type pcolParent struct {
 func preprocessTransforms(trs map[string]*pipepb.PTransform) (map[string]pcolParent, []string) {
 	ret := map[string]pcolParent{}
 	var leaves []string
-	for id, t := range trs {
+	keys := maps.Keys(trs)
+	sort.Strings(keys)
+	for _, id := range keys {
+		t := trs[id]
 		// Skip composites at this time.
 		if len(t.GetSubtransforms()) > 0 {
 			continue
@@ -284,17 +345,97 @@ func (h *jobsConsoleHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	renderPage(indexPage, data, w)
 }
 
+type debugzHandler struct {
+}
+
+func (h *debugzHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	data := dumpMetrics()
+	renderPage(debugzPage, &data, w)
+}
+
+var grpcToHttpCodes = map[codes.Code]int{
+	codes.OK:                http.StatusOK,
+	codes.Canceled:          http.StatusRequestTimeout,
+	codes.Unknown:           http.StatusInternalServerError,
+	codes.InvalidArgument:   http.StatusBadRequest,
+	codes.DeadlineExceeded:  http.StatusRequestTimeout,
+	codes.NotFound:          http.StatusNotFound,
+	codes.PermissionDenied:  http.StatusForbidden,
+	codes.ResourceExhausted: http.StatusTooManyRequests,
+	codes.Aborted:           http.StatusConflict,
+	codes.Unimplemented:     http.StatusNotImplemented,
+	codes.OutOfRange:        http.StatusBadRequest,
+	codes.Internal:          http.StatusInternalServerError,
+	codes.Unavailable:       http.StatusServiceUnavailable,
+	codes.DataLoss:          http.StatusInternalServerError,
+}
+
+type jobCancelHandler struct {
+	Jobcli jobpb.JobServiceClient
+}
+
+type cancelJobRequest struct {
+	JobID string `json:"job_id"`
+}
+
+func (h *jobCancelHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var cancelRequest *cancelJobRequest
+	if r.Method != http.MethodPost {
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		err = fmt.Errorf("could not read request body: %w", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) == 0 {
+		http.Error(w, "empty request body", http.StatusBadRequest)
+		return
+	}
+	if err := json.Unmarshal(body, &cancelRequest); err != nil {
+		err = fmt.Errorf("error parsing JSON: %s of request: %w", body, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Forward JobId from POST body avoids direct json Unmarshall on composite types containing protobuf message types.
+	resp, err := h.Jobcli.Cancel(r.Context(), &jobpb.CancelJobRequest{
+		JobId: cancelRequest.JobID,
+	})
+	if err != nil {
+		statusCode := status.Code(err)
+		httpCode := http.StatusInternalServerError
+		if c, ok := grpcToHttpCodes[statusCode]; ok {
+			httpCode = c
+		}
+		err = fmt.Errorf("error Cancel(%+v) = %w", cancelRequest, err)
+		http.Error(w, err.Error(), httpCode)
+	}
+
+	w.Header().Add(kContentType, kApplicationJson)
+
+	if err = json.NewEncoder(w).Encode(resp); err != nil {
+		err = fmt.Errorf("error encoding response: %w", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
 // Initialize the web client to talk to the given Job Management Client.
 func Initialize(ctx context.Context, port int, jobcli jobpb.JobServiceClient) error {
 	assetsFs := http.FileServer(http.FS(assets))
 	mux := http.NewServeMux()
 
 	mux.Handle("/assets/", assetsFs)
+	mux.Handle("/job/cancel/", &jobCancelHandler{Jobcli: jobcli})
 	mux.Handle("/job/", &jobDetailsHandler{Jobcli: jobcli})
+	mux.Handle("/debugz", &debugzHandler{})
 	mux.Handle("/", &jobsConsoleHandler{Jobcli: jobcli})
 
 	endpoint := fmt.Sprintf("localhost:%d", port)
 
 	slog.Info("Serving WebUI", slog.String("endpoint", "http://"+endpoint))
-	return http.ListenAndServe(endpoint, mux)
+	go http.ListenAndServe(endpoint, mux)
+	return nil
 }

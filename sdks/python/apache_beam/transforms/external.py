@@ -23,12 +23,12 @@ import copy
 import functools
 import glob
 import logging
+import re
 import subprocess
 import threading
 import uuid
 from collections import OrderedDict
 from collections import namedtuple
-from typing import Dict
 
 import grpc
 
@@ -41,8 +41,10 @@ from apache_beam.portability.api import beam_expansion_api_pb2
 from apache_beam.portability.api import beam_expansion_api_pb2_grpc
 from apache_beam.portability.api import beam_runner_api_pb2
 from apache_beam.portability.api import external_transforms_pb2
+from apache_beam.portability.api import schema_pb2
 from apache_beam.runners import pipeline_context
 from apache_beam.runners.portability import artifact_service
+from apache_beam.transforms import environments
 from apache_beam.transforms import ptransform
 from apache_beam.typehints import WithTypeHints
 from apache_beam.typehints import native_type_compatibility
@@ -50,6 +52,7 @@ from apache_beam.typehints import row_type
 from apache_beam.typehints.schemas import named_fields_to_schema
 from apache_beam.typehints.schemas import named_tuple_from_schema
 from apache_beam.typehints.schemas import named_tuple_to_schema
+from apache_beam.typehints.schemas import typing_from_runner_api
 from apache_beam.typehints.trivial_inference import instance_to_type
 from apache_beam.typehints.typehints import Union
 from apache_beam.typehints.typehints import UnionConstraint
@@ -63,7 +66,7 @@ def convert_to_typing_type(type_):
   if isinstance(type_, row_type.RowTypeConstraint):
     return named_tuple_from_schema(named_fields_to_schema(type_._fields))
   else:
-    return native_type_compatibility.convert_to_typing_type(type_)
+    return native_type_compatibility.convert_to_python_type(type_)
 
 
 def _is_optional_or_none(typehint):
@@ -185,6 +188,14 @@ class SchemaTransformPayloadBuilder(PayloadBuilder):
     self._identifier = identifier
     self._kwargs = kwargs
 
+  def identifier(self):
+    """
+    The URN referencing this SchemaTransform
+
+    :return: str
+    """
+    return self._identifier
+
   def build(self):
     schema_proto, payload = self._get_schema_proto_and_payload(**self._kwargs)
     payload = external_transforms_pb2.SchemaTransformPayload(
@@ -192,6 +203,57 @@ class SchemaTransformPayloadBuilder(PayloadBuilder):
         configuration_schema=schema_proto,
         configuration_row=payload)
     return payload
+
+
+class ExplicitSchemaTransformPayloadBuilder(SchemaTransformPayloadBuilder):
+  def __init__(self, identifier, schema_proto, **kwargs):
+    self._identifier = identifier
+    self._schema_proto = schema_proto
+    self._kwargs = kwargs
+
+  def build(self):
+    def dict_to_row_recursive(field_type, py_value):
+      if py_value is None:
+        return None
+      type_info = field_type.WhichOneof('type_info')
+      if type_info == 'row_type':
+        return dict_to_row(field_type.row_type.schema, py_value)
+      elif type_info == 'array_type':
+        return [
+            dict_to_row_recursive(field_type.array_type.element_type, value)
+            for value in py_value
+        ]
+      elif type_info == 'map_type':
+        return {
+            key: dict_to_row_recursive(field_type.map_type.value_type, value)
+            for key,
+            value in py_value.items()
+        }
+      else:
+        return py_value
+
+    def dict_to_row(schema_proto, py_value):
+      row_type = named_tuple_from_schema(schema_proto)
+      if isinstance(py_value, dict):
+        extra = set(py_value.keys()) - set(row_type._fields)
+        if extra:
+          raise ValueError(
+              f"Transform '{self.identifier()}' was configured with unknown "
+              f"fields: {extra}. Valid fields: {set(row_type._fields)}")
+        return row_type(
+            *[
+                dict_to_row_recursive(
+                    field.type, py_value.get(field.name, None))
+                for field in schema_proto.fields
+            ])
+      else:
+        return row_type(py_value)
+
+    return external_transforms_pb2.SchemaTransformPayload(
+        identifier=self._identifier,
+        configuration_schema=self._schema_proto,
+        configuration_row=RowCoder(self._schema_proto).encode(
+            dict_to_row(self._schema_proto, self._kwargs)))
 
 
 class JavaClassLookupPayloadBuilder(PayloadBuilder):
@@ -314,7 +376,7 @@ class JavaClassLookupPayloadBuilder(PayloadBuilder):
 # Information regarding a SchemaTransform available in an external SDK.
 SchemaTransformsConfig = namedtuple(
     'SchemaTransformsConfig',
-    ['identifier', 'configuration_schema', 'inputs', 'outputs'])
+    ['identifier', 'configuration_schema', 'inputs', 'outputs', 'description'])
 
 
 class SchemaAwareExternalTransform(ptransform.PTransform):
@@ -351,66 +413,73 @@ class SchemaAwareExternalTransform(ptransform.PTransform):
 
     _kwargs = kwargs
     if rearrange_based_on_discovery:
-      _kwargs = self._rearrange_kwargs(identifier)
+      config = SchemaAwareExternalTransform.discover_config(
+          self._expansion_service, identifier)
+      self._payload_builder = ExplicitSchemaTransformPayloadBuilder(
+          identifier,
+          named_tuple_to_schema(config.configuration_schema),
+          **_kwargs)
 
-    self._payload_builder = SchemaTransformPayloadBuilder(identifier, **_kwargs)
-
-  def _rearrange_kwargs(self, identifier):
-    # discover and fetch the external SchemaTransform configuration then
-    # use it to build an appropriate payload
-    schematransform_config = SchemaAwareExternalTransform.discover_config(
-        self._expansion_service, identifier)
-
-    external_config_fields = schematransform_config.configuration_schema._fields
-    ordered_kwargs = OrderedDict()
-    missing_fields = []
-
-    for field in external_config_fields:
-      if field not in self._kwargs:
-        missing_fields.append(field)
-      else:
-        ordered_kwargs[field] = self._kwargs[field]
-
-    extra_fields = list(set(self._kwargs.keys()) - set(external_config_fields))
-    if missing_fields:
-      raise ValueError(
-          'Input parameters are missing the following SchemaTransform config '
-          'fields: %s' % missing_fields)
-    elif extra_fields:
-      raise ValueError(
-          'Input parameters include the following extra fields that are not '
-          'found in the SchemaTransform config schema: %s' % extra_fields)
-
-    return ordered_kwargs
+    else:
+      self._payload_builder = SchemaTransformPayloadBuilder(
+          identifier, **_kwargs)
 
   def expand(self, pcolls):
     # Expand the transform using the expansion service.
-    return pcolls | ExternalTransform(
+    return pcolls | self._payload_builder.identifier() >> ExternalTransform(
         common_urns.schematransform_based_expand.urn,
         self._payload_builder,
         self._expansion_service)
 
-  @staticmethod
-  def discover(expansion_service):
+  @classmethod
+  @functools.lru_cache
+  def discover(cls, expansion_service, ignore_errors=False):
     """Discover all SchemaTransforms available to the given expansion service.
 
     :return: a list of SchemaTransformsConfigs that represent the discovered
         SchemaTransforms.
     """
+    return list(cls.discover_iter(expansion_service, ignore_errors))
 
+  @staticmethod
+  def discover_iter(expansion_service, ignore_errors=True):
     with ExternalTransform.service(expansion_service) as service:
       discover_response = service.DiscoverSchemaTransform(
           beam_expansion_api_pb2.DiscoverSchemaTransformRequest())
 
-      for identifier in discover_response.schema_transform_configs:
-        proto_config = discover_response.schema_transform_configs[identifier]
+    for identifier in discover_response.schema_transform_configs:
+      proto_config = discover_response.schema_transform_configs[identifier]
+      try:
         schema = named_tuple_from_schema(proto_config.config_schema)
+      except Exception as exn:
+        if ignore_errors:
+          truncated_schema = schema_pb2.Schema()
+          truncated_schema.CopyFrom(proto_config.config_schema)
+          for field in truncated_schema.fields:
+            try:
+              typing_from_runner_api(field.type)
+            except Exception:
+              if field.type.nullable:
+                # Set it to an empty placeholder type.
+                field.type.CopyFrom(
+                    schema_pb2.FieldType(
+                        nullable=True,
+                        row_type=schema_pb2.RowType(
+                            schema=schema_pb2.Schema())))
+          try:
+            schema = named_tuple_from_schema(truncated_schema)
+          except Exception as exn:
+            logging.info("Bad schema for %s: %s", identifier, str(exn)[:250])
+            continue
+        else:
+          raise
 
-        yield SchemaTransformsConfig(
-            identifier=identifier,
-            configuration_schema=schema,
-            inputs=proto_config.input_pcollection_names,
-            outputs=proto_config.output_pcollection_names)
+      yield SchemaTransformsConfig(
+          identifier=identifier,
+          configuration_schema=schema,
+          inputs=proto_config.input_pcollection_names,
+          outputs=proto_config.output_pcollection_names,
+          description=proto_config.description)
 
   @staticmethod
   def discover_config(expansion_service, name):
@@ -424,7 +493,8 @@ class SchemaAwareExternalTransform(ptransform.PTransform):
       are discovered
     """
 
-    schematransforms = SchemaAwareExternalTransform.discover(expansion_service)
+    schematransforms = SchemaAwareExternalTransform.discover(
+        expansion_service, ignore_errors=True)
     matched = []
 
     for st in schematransforms:
@@ -583,8 +653,8 @@ class ExternalTransform(ptransform.PTransform):
         payload.payload() if isinstance(payload, PayloadBuilder) else payload)
     self._expansion_service = expansion_service
     self._external_namespace = self._fresh_namespace()
-    self._inputs = {}  # type: Dict[str, pvalue.PCollection]
-    self._outputs = {}  # type: Dict[str, pvalue.PCollection]
+    self._inputs: dict[str, pvalue.PCollection] = {}
+    self._outputs: dict[str, pvalue.PCollection] = {}
 
   def with_output_types(self, *args, **kwargs):
     return WithTypeHints.with_output_types(self, *args, **kwargs)
@@ -614,18 +684,18 @@ class ExternalTransform(ptransform.PTransform):
   @contextlib.contextmanager
   def outer_namespace(cls, namespace):
     prev = cls.get_local_namespace()
-    cls._external_namespace.value = namespace
-    yield
-    cls._external_namespace.value = prev
+    try:
+      cls._external_namespace.value = namespace
+      yield
+    finally:
+      cls._external_namespace.value = prev
 
   @classmethod
-  def _fresh_namespace(cls):
-    # type: () -> str
+  def _fresh_namespace(cls) -> str:
     ExternalTransform._namespace_counter += 1
     return '%s_%d' % (cls.get_local_namespace(), cls._namespace_counter)
 
-  def expand(self, pvalueish):
-    # type: (pvalue.PCollection) -> pvalue.PCollection
+  def expand(self, pvalueish: pvalue.PCollection) -> pvalue.PCollection:
     if isinstance(pvalueish, pvalue.PBegin):
       self._inputs = {}
     elif isinstance(pvalueish, (list, tuple)):
@@ -668,9 +738,10 @@ class ExternalTransform(ptransform.PTransform):
     components = context.to_runner_api()
     request = beam_expansion_api_pb2.ExpansionRequest(
         components=components,
-        namespace=self._external_namespace,
+        namespace=self._external_namespace,  # type: ignore[arg-type]
         transform=transform_proto,
-        output_coder_requests=output_coders)
+        output_coder_requests=output_coders,
+        pipeline_options=pipeline._options.to_runner_api())
 
     expansion_service = _maybe_use_transform_service(
         self._expansion_service, pipeline.options)
@@ -678,10 +749,11 @@ class ExternalTransform(ptransform.PTransform):
     with ExternalTransform.service(expansion_service) as service:
       response = service.Expand(request)
       if response.error:
-        raise RuntimeError(response.error)
+        raise RuntimeError(_sanitize_java_traceback(response.error))
       self._expanded_components = response.components
-      if any(env.dependencies
-             for env in self._expanded_components.environments.values()):
+      if any(e.dependencies
+             for env in self._expanded_components.environments.values()
+             for e in environments.expand_anyof_environments(env)):
         self._expanded_components = self._resolve_artifacts(
             self._expanded_components,
             service.artifact_service(),
@@ -734,12 +806,22 @@ class ExternalTransform(ptransform.PTransform):
         yield stub
 
   def _resolve_artifacts(self, components, service, dest):
-    for env in components.environments.values():
-      if env.dependencies:
+    def _resolve_artifacts_for(env):
+      if env.urn == common_urns.environments.ANYOF.urn:
+        env.CopyFrom(
+            environments.AnyOfEnvironment.create_proto([
+                _resolve_artifacts_for(e)
+                for e in environments.expand_anyof_environments(env)
+            ]))
+      elif env.dependencies:
         resolved = list(
             artifact_service.resolve_artifacts(env.dependencies, service, dest))
         del env.dependencies[:]
         env.dependencies.extend(resolved)
+      return env
+
+    for env in components.environments.values():
+      _resolve_artifacts_for(env)
     return components
 
   def _output_to_pvalueish(self, output_dict):
@@ -839,6 +921,7 @@ class ExternalTransform(ptransform.PTransform):
             for tag,
             pcoll in self._expanded_transform.outputs.items()
         },
+        annotations=self._expanded_transform.annotations,
         environment_id=self._expanded_transform.environment_id)
 
 
@@ -879,14 +962,14 @@ class JavaJarExpansionService(object):
       self, path_to_jar, extra_args=None, classpath=None, append_args=None):
     if extra_args and append_args:
       raise ValueError('Only one of extra_args or append_args may be provided')
-    self._path_to_jar = path_to_jar
+    self.path_to_jar = path_to_jar
     self._extra_args = extra_args
     self._classpath = classpath or []
     self._service_count = 0
     self._append_args = append_args or []
 
   def is_existing_service(self):
-    return subprocess_server.is_service_endpoint(self._path_to_jar)
+    return subprocess_server.is_service_endpoint(self.path_to_jar)
 
   @staticmethod
   def _expand_jars(jar):
@@ -914,15 +997,20 @@ class JavaJarExpansionService(object):
   def _default_args(self):
     """Default arguments to be used by `JavaJarExpansionService`."""
 
-    to_stage = ','.join([self._path_to_jar] + sum((
+    to_stage = ','.join([self.path_to_jar] + sum((
         JavaJarExpansionService._expand_jars(jar)
         for jar in self._classpath or []), []))
-    return ['{{PORT}}', f'--filesToStage={to_stage}']
+    args = ['{{PORT}}', f'--filesToStage={to_stage}']
+    # TODO(robertwb): See if it's possible to scope this per pipeline.
+    # Checks to see if the cache is being used for this server.
+    if subprocess_server.SubprocessServer._cache._live_owners:
+      args.append('--alsoStartLoopbackWorker')
+    return args
 
   def __enter__(self):
     if self._service_count == 0:
-      self._path_to_jar = subprocess_server.JavaJarServer.local_jar(
-          self._path_to_jar)
+      self.path_to_jar = subprocess_server.JavaJarServer.local_jar(
+          self.path_to_jar)
       if self._extra_args is None:
         self._extra_args = self._default_args() + self._append_args
       # Consider memoizing these servers (with some timeout).
@@ -930,7 +1018,7 @@ class JavaJarExpansionService(object):
           'Starting a JAR-based expansion service from JAR %s ' + (
               'and with classpath: %s' %
               self._classpath if self._classpath else ''),
-          self._path_to_jar)
+          self.path_to_jar)
       classpath_urls = [
           subprocess_server.JavaJarServer.local_jar(path)
           for jar in self._classpath
@@ -938,7 +1026,7 @@ class JavaJarExpansionService(object):
       ]
       self._service_provider = subprocess_server.JavaJarServer(
           ExpansionAndArtifactRetrievalStub,
-          self._path_to_jar,
+          self.path_to_jar,
           self._extra_args,
           classpath=classpath_urls)
       self._service = self._service_provider.__enter__()
@@ -979,6 +1067,7 @@ class BeamJarExpansionService(JavaJarExpansionService):
       append_args=None):
     path_to_jar = subprocess_server.JavaJarServer.path_to_beam_jar(
         gradle_target, gradle_appendix)
+    self.gradle_target = gradle_target
     super().__init__(
         path_to_jar, extra_args, classpath=classpath, append_args=append_args)
 
@@ -1051,6 +1140,35 @@ def _maybe_use_transform_service(provided_service=None, options=None):
     raise ValueError(
         'Cannot start an expansion service since neither Java nor '
         'Docker executables are available in the system.')
+
+
+def _sanitize_java_traceback(s):
+  """Attempts to highlight the root cause in the error string.
+
+  Java tracebacks read bottom to top, while Python tracebacks read top to
+  bottom, resulting in the actual error message getting sandwiched between two
+  walls of text.  This may result in the error being duplicated (as we don't
+  want to remove relevant information) but should be clearer in most cases.
+
+  Best-effort but non-destructive.
+  """
+  # We delete non-java-traceback lines.
+  traceback_lines = [
+      r'\tat \S+\(\S+\.java:\d+\)',
+      r'\t\.\.\. \d+ more',
+      # A bit more restrictive to avoid accidentally capturing non-java lines.
+      r'Caused by: [a-z]+(\.\S+)?\.[A-Z][A-Za-z0-9_$]+(Error|Exception):[^\n]*'
+  ]
+  without_java_traceback = s + '\n'
+  for p in traceback_lines:
+    without_java_traceback = re.sub(
+        fr'\n{p}$', '', without_java_traceback, flags=re.M)
+  # If what's left is substantially smaller, duplicate it at the end for better
+  # visibility.
+  if len(without_java_traceback) < len(s) / 2:
+    return s + '\n\n' + without_java_traceback.strip()
+  else:
+    return s
 
 
 def memoize(func):

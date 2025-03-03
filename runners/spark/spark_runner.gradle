@@ -25,9 +25,11 @@ applyJavaNature(
   archivesBaseName: (project.hasProperty('archives_base_name') ? archives_base_name : archivesBaseName),
   exportJavadoc: (project.hasProperty('exportJavadoc') ? exportJavadoc : true),
   classesTriggerCheckerBugs: [
+    'Aggregators': 'https://github.com/typetools/checker-framework/issues/6388#issuecomment-1885532351',
     'SparkAssignWindowFn': 'https://github.com/typetools/checker-framework/issues/3793',
     'SparkCombineFn'     : 'https://github.com/typetools/checker-framework/issues/3793',
     'WindowingHelpers'   : 'https://github.com/typetools/checker-framework/issues/3793',
+    'WindowAssignTranslatorBatch': 'https://github.com/typetools/checker-framework/issues/6388#issuecomment-1885532351',
   ],
 )
 
@@ -63,8 +65,9 @@ def sparkTestProperties(overrides = [:]) {
 
 
 def sparkTestJvmArgs() {
-  // run tests with Java 17 using -PcompileAndRunTestsWithJava17 -Pjava17Home=???
-  if (project.hasProperty("compileAndRunTestsWithJava17")) {
+  // run tests with Java 17 using -PtestJavaVersion=17 -Pjava17Home=???
+  if (project.hasProperty('testJavaVersion') &&
+          project.getProperty('testJavaVersion') in ['17', '21']) {
     return [
       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
       // add-opens below required for Kryo FieldSerializer / SparkRunnerKryoRegistratorTest
@@ -156,7 +159,6 @@ spark.components = [
 dependencies {
   implementation project(path: ":model:pipeline", configuration: "shadow")
   implementation project(path: ":sdks:java:core", configuration: "shadow")
-  implementation project(":runners:core-construction-java")
   implementation project(":runners:core-java")
   implementation project(":runners:java-fn-execution")
   implementation project(":runners:java-job-service")
@@ -169,11 +171,14 @@ dependencies {
   implementation library.java.args4j
   implementation project(path: ":model:fn-execution", configuration: "shadow")
   implementation project(path: ":model:job-management", configuration: "shadow")
-  implementation project(":sdks:java:fn-execution")
-  implementation library.java.vendored_grpc_1_54_0
+  implementation library.java.vendored_grpc_1_69_0
   implementation library.java.vendored_guava_32_1_2_jre
   spark.components.each { component ->
     provided "$component:$spark_version"
+  }
+  if ("$spark_version" >= "3.5.0") {
+    implementation "org.apache.spark:spark-common-utils_$spark_scala_version:$spark_version"
+    implementation "org.apache.spark:spark-sql-api_$spark_scala_version:$spark_version"
   }
   permitUnusedDeclared "org.apache.spark:spark-network-common_$spark_scala_version:$spark_version"
   implementation "io.dropwizard.metrics:metrics-core:4.1.1" // version used by Spark 3.1
@@ -201,12 +206,18 @@ dependencies {
   testImplementation library.java.mockito_core
   testImplementation "org.assertj:assertj-core:3.11.1"
   testImplementation "org.apache.zookeeper:zookeeper:3.4.11"
+  if ("$spark_version" >= "3.5.0") {
+    testImplementation "org.apache.spark:spark-common-utils_$spark_scala_version:$spark_version"
+    testImplementation "org.apache.spark:spark-sql-api_$spark_scala_version:$spark_version"
+  }
   validatesRunner project(path: ":sdks:java:core", configuration: "shadowTest")
   validatesRunner project(path: ":runners:core-java", configuration: "testRuntimeMigration")
   validatesRunner project(":sdks:java:io:hadoop-format")
   validatesRunner project(":sdks:java:io:hadoop-format").sourceSets.test.output
   validatesRunner project(path: ":examples:java", configuration: "testRuntimeMigration")
   validatesRunner project(path: project.path, configuration: "testRuntimeMigration")
+  validatesRunner library.java.log4j2_api
+  validatesRunner library.java.log4j2_core
   hadoopVersions.each { kv ->
     "hadoopVersion$kv.key" "org.apache.hadoop:hadoop-common:$kv.value"
     // Force paranamer 2.8 to avoid issues when using Scala 2.12
@@ -273,8 +284,7 @@ def applyBatchValidatesRunnerSetup = { Test it ->
     // SDF
     excludeCategories 'org.apache.beam.sdk.testing.UsesUnboundedSplittableParDo'
     // Portability
-    excludeCategories 'org.apache.beam.sdk.testing.UsesJavaExpansionService'
-    excludeCategories 'org.apache.beam.sdk.testing.UsesPythonExpansionService'
+    excludeCategories 'org.apache.beam.sdk.testing.UsesExternalService'
     excludeCategories 'org.apache.beam.sdk.testing.UsesBundleFinalizer'
     // Ordering
     excludeCategories 'org.apache.beam.sdk.testing.UsesPerKeyOrderedDelivery'
@@ -286,6 +296,13 @@ def applyBatchValidatesRunnerSetup = { Test it ->
 def validatesRunnerBatch = tasks.register("validatesRunnerBatch", Test) {
   applyBatchValidatesRunnerSetup(it)
   systemProperties sparkTestProperties(["--enableSparkMetricSinks":"false"])
+
+  // TODO(https://github.com/apache/beam/issues/31231
+  it.filter {
+    excludeTestsMatching 'org.apache.beam.sdk.transforms.RedistributeTest.testRedistributePreservesMetadata'
+    // TODO(https://github.com/apache/beam/issues/32021)
+    excludeTestsMatching 'org.apache.beam.sdk.metrics.MetricsTest$AttemptedMetricTests.testBoundedSourceMetricsInSplit'
+  }
 }
 
 def validatesRunnerBatchWithBoundedSDFExperiment = tasks.register("validatesRunnerBatchWithBoundedSDFExperiment", Test) {
@@ -320,6 +337,12 @@ def validatesRunnerStreaming = tasks.register("validatesRunnerStreaming", Test) 
       // UNBOUNDED View.CreatePCollectionView not supported
       excludeTestsMatching 'org.apache.beam.sdk.transforms.ParDoTest$BundleInvariantsTests.testWatermarkUpdateMidBundle'
       excludeTestsMatching 'org.apache.beam.sdk.transforms.ViewTest.testWindowedSideInputNotPresent'
+      // TODO(https://github.com/apache/beam/issues/29973)
+      excludeTestsMatching 'org.apache.beam.sdk.transforms.ReshuffleTest.testReshufflePreservesMetadata'
+      // TODO(https://github.com/apache/beam/issues/31231
+      excludeTestsMatching 'org.apache.beam.sdk.transforms.RedistributeTest.testRedistributePreservesMetadata'
+      // TODO(https://github.com/apache/beam/issues/32021)
+      excludeTestsMatching 'org.apache.beam.sdk.metrics.MetricsTest$AttemptedMetricTests.testBoundedSourceMetricsInSplit'
     }
 
     // TestStream using processing time is not supported in Spark
@@ -332,7 +355,7 @@ def validatesRunnerStreaming = tasks.register("validatesRunnerStreaming", Test) 
     excludeCategories 'org.apache.beam.sdk.testing.UsesSdkHarnessEnvironment'
 
     // State and Timers
-    excludeCategories 'org.apache.beam.sdk.testing.UsesStatefulParDo'
+    excludeCategories 'org.apache.beam.sdk.testing.UsesTestStreamWithMultipleStages'
     excludeCategories 'org.apache.beam.sdk.testing.UsesTimersInParDo'
     excludeCategories 'org.apache.beam.sdk.testing.UsesTimerMap'
     excludeCategories 'org.apache.beam.sdk.testing.UsesLoopingTimer'
@@ -346,8 +369,7 @@ def validatesRunnerStreaming = tasks.register("validatesRunnerStreaming", Test) 
     excludeCategories 'org.apache.beam.sdk.testing.UsesUnboundedSplittableParDo'
     excludeCategories 'org.apache.beam.sdk.testing.UsesBoundedSplittableParDo'
     // Portability
-    excludeCategories 'org.apache.beam.sdk.testing.UsesJavaExpansionService'
-    excludeCategories 'org.apache.beam.sdk.testing.UsesPythonExpansionService'
+    excludeCategories 'org.apache.beam.sdk.testing.UsesExternalService'
     excludeCategories 'org.apache.beam.sdk.testing.UsesBundleFinalizer'
     // Ordering
     excludeCategories 'org.apache.beam.sdk.testing.UsesPerKeyOrderedDelivery'
@@ -402,8 +424,7 @@ tasks.register("validatesStructuredStreamingRunnerBatch", Test) {
     // SDF
     excludeCategories 'org.apache.beam.sdk.testing.UsesUnboundedSplittableParDo'
     // Portability
-    excludeCategories 'org.apache.beam.sdk.testing.UsesJavaExpansionService'
-    excludeCategories 'org.apache.beam.sdk.testing.UsesPythonExpansionService'
+    excludeCategories 'org.apache.beam.sdk.testing.UsesExternalService'
     excludeCategories 'org.apache.beam.sdk.testing.UsesBundleFinalizer'
     excludeCategories 'org.apache.beam.sdk.testing.UsesTriggeredSideInputs'
   }
@@ -419,6 +440,10 @@ tasks.register("validatesStructuredStreamingRunnerBatch", Test) {
     excludeTestsMatching 'org.apache.beam.sdk.transforms.FlattenTest.testFlattenMultipleCoders'
     // SDF
     excludeTestsMatching 'org.apache.beam.sdk.transforms.SplittableDoFnTest.testLifecycleMethodsBounded'
+    // https://github.com/apache/beam/issues/29972
+    excludeTestsMatching 'org.apache.beam.sdk.transforms.CombineTest$CombineWithContextTests.testHotKeyCombineWithSideInputs'
+    // TODO(https://github.com/apache/beam/issues/32021)
+    excludeTestsMatching 'org.apache.beam.sdk.metrics.MetricsTest$AttemptedMetricTests.testBoundedSourceMetricsInSplit'
   }
 }
 
