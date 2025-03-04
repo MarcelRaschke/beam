@@ -30,9 +30,6 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.Map;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
-import org.apache.beam.runners.core.construction.ModelCoders;
-import org.apache.beam.runners.core.construction.PipelineTranslation;
-import org.apache.beam.runners.core.construction.SdkComponents;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.coders.BigEndianIntegerCoder;
 import org.apache.beam.sdk.coders.KvCoder;
@@ -42,6 +39,9 @@ import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.Combine.CombineFn;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.ModelCoders;
+import org.apache.beam.sdk.util.construction.PipelineTranslation;
+import org.apache.beam.sdk.util.construction.SdkComponents;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
@@ -120,9 +120,12 @@ public class CombineRunnersTest {
   public void testPrecombine() throws Exception {
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(TEST_COMBINE_ID, pTransform)
-            .pCollections(pProto.getComponents().getPcollectionsMap())
-            .coders(pProto.getComponents().getCodersMap())
-            .windowingStrategies(pProto.getComponents().getWindowingStrategiesMap())
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(pProto.getComponents().getPcollectionsMap())
+                    .putAllCoders(pProto.getComponents().getCodersMap())
+                    .putAllWindowingStrategies(pProto.getComponents().getWindowingStrategiesMap())
+                    .build())
             .build();
     // Add a consumer and output target to check output values.
     Deque<WindowedValue<KV<String, Integer>>> mainOutputValues = new ArrayDeque<>();
@@ -201,8 +204,11 @@ public class CombineRunnersTest {
 
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(TEST_COMBINE_ID, pTransform)
-            .pCollections(pCollectionMap)
-            .coders(coderMap)
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(pCollectionMap)
+                    .putAllCoders(coderMap)
+                    .build())
             .build();
     // Add a consumer and output target to check output values.
     Deque<WindowedValue<KV<String, Integer>>> mainOutputValues = new ArrayDeque<>();
@@ -262,8 +268,11 @@ public class CombineRunnersTest {
             .build());
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(TEST_COMBINE_ID, pTransform)
-            .pCollections(pCollectionMap)
-            .coders(coderMap)
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(pCollectionMap)
+                    .putAllCoders(coderMap)
+                    .build())
             .build();
     // Add a consumer and output target to check output values.
     Deque<WindowedValue<KV<String, Integer>>> mainOutputValues = new ArrayDeque<>();
@@ -306,8 +315,11 @@ public class CombineRunnersTest {
   public void testConvertToAccumulators() throws Exception {
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(TEST_COMBINE_ID, pTransform)
-            .pCollections(pProto.getComponents().getPcollectionsMap())
-            .coders(pProto.getComponents().getCodersMap())
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(pProto.getComponents().getPcollectionsMap())
+                    .putAllCoders(pProto.getComponents().getCodersMap())
+                    .build())
             .build();
     // Add a consumer and output target to check output values.
     Deque<WindowedValue<KV<String, Integer>>> mainOutputValues = new ArrayDeque<>();
@@ -373,8 +385,11 @@ public class CombineRunnersTest {
             .build());
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(TEST_COMBINE_ID, pTransform)
-            .pCollections(pCollectionMap)
-            .coders(coderMap)
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(pCollectionMap)
+                    .putAllCoders(coderMap)
+                    .build())
             .build();
     // Add a consumer and output target to check output values.
     Deque<WindowedValue<KV<String, Integer>>> mainOutputValues = new ArrayDeque<>();

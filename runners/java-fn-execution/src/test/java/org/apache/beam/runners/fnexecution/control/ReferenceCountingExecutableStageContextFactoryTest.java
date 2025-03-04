@@ -17,7 +17,7 @@
  */
 package org.apache.beam.runners.fnexecution.control;
 
-import static org.mockito.Matchers.any;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -28,12 +28,14 @@ import org.apache.beam.sdk.testing.ExpectedLogs;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 /** Tests for {@link ReferenceCountingExecutableStageContextFactory}. */
 @RunWith(JUnit4.class)
 public class ReferenceCountingExecutableStageContextFactoryTest {
+  @Rule public transient Timeout globalTimeout = Timeout.seconds(600);
 
   @Rule
   public ExpectedLogs expectedLogs =

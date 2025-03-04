@@ -27,6 +27,7 @@ package jobservices
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -37,12 +38,16 @@ import (
 	jobpb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/jobmanagement_v1"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/runners/prism/internal/urns"
-	"golang.org/x/exp/slog"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/runners/prism/internal/worker"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var supportedRequirements = map[string]struct{}{
-	urns.RequirementSplittableDoFn: {},
+	urns.RequirementSplittableDoFn:     {},
+	urns.RequirementStatefulProcessing: {},
+	urns.RequirementBundleFinalization: {},
+	urns.RequirementOnWindowExpiration: {},
+	urns.RequirementTimeSortedInput:    {},
 }
 
 // TODO, move back to main package, and key off of executor handlers?
@@ -68,6 +73,8 @@ type Job struct {
 	key     string
 	jobName string
 
+	artifactEndpoint string
+
 	Pipeline *pipepb.Pipeline
 	options  *structpb.Struct
 
@@ -84,12 +91,23 @@ type Job struct {
 	// Context used to terminate this job.
 	RootCtx  context.Context
 	CancelFn context.CancelCauseFunc
+	// Logger for this job.
+	Logger *slog.Logger
 
 	metrics metricsStore
+	mw      *worker.MultiplexW
+}
+
+func (j *Job) ArtifactEndpoint() string {
+	return j.artifactEndpoint
+}
+
+func (j *Job) PipelineOptions() *structpb.Struct {
+	return j.options
 }
 
 // ContributeTentativeMetrics returns the datachannel read index, and any unknown monitoring short ids.
-func (j *Job) ContributeTentativeMetrics(payloads *fnpb.ProcessBundleProgressResponse) (int64, []string) {
+func (j *Job) ContributeTentativeMetrics(payloads *fnpb.ProcessBundleProgressResponse) (map[string]int64, []string) {
 	return j.metrics.ContributeTentativeMetrics(payloads)
 }
 
@@ -111,6 +129,10 @@ func (j *Job) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("key", j.key),
 		slog.String("name", j.jobName))
+}
+
+func (j *Job) JobKey() string {
+	return j.key
 }
 
 func (j *Job) SendMsg(msg string) {
@@ -137,9 +159,13 @@ func (j *Job) SendMsg(msg string) {
 func (j *Job) sendState(state jobpb.JobState_Enum) {
 	j.streamCond.L.Lock()
 	defer j.streamCond.L.Unlock()
-	j.stateTime = time.Now()
-	j.stateIdx++
-	j.state.Store(state)
+	old := j.state.Load()
+	// Never overwrite a failed state with another one.
+	if old != jobpb.JobState_FAILED {
+		j.state.Store(state)
+		j.stateTime = time.Now()
+		j.stateIdx++
+	}
 	j.streamCond.Broadcast()
 }
 
@@ -158,9 +184,31 @@ func (j *Job) Done() {
 	j.sendState(jobpb.JobState_DONE)
 }
 
+// Canceling indicates that the job is canceling.
+func (j *Job) Canceling() {
+	j.sendState(jobpb.JobState_CANCELLING)
+}
+
+// Canceled indicates that the job is canceled.
+func (j *Job) Canceled() {
+	j.sendState(jobpb.JobState_CANCELLED)
+}
+
 // Failed indicates that the job completed unsuccessfully.
 func (j *Job) Failed(err error) {
+	slog.Error("job failed", slog.Any("job", j), slog.Any("error", err))
 	j.failureErr = err
 	j.sendState(jobpb.JobState_FAILED)
-	j.CancelFn(err)
+	j.CancelFn(fmt.Errorf("jobFailed %v: %w", j, err))
+}
+
+// MakeWorker instantiates a worker.W populating environment and pipeline data from the Job.
+func (j *Job) MakeWorker(env string) *worker.W {
+	wk := j.mw.MakeWorker(j.String()+"_"+env, env)
+	wk.EnvPb = j.Pipeline.GetComponents().GetEnvironments()[env]
+	wk.PipelineOptions = j.PipelineOptions()
+	wk.JobKey = j.JobKey()
+	wk.ArtifactEndpoint = j.ArtifactEndpoint()
+
+	return wk
 }

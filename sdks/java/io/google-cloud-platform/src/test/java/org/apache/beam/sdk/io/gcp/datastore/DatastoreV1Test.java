@@ -43,12 +43,12 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.eq;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
-import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.mockito.Mockito.when;
 
 import com.google.datastore.v1.CommitRequest;
@@ -125,6 +125,7 @@ import org.mockito.MockitoAnnotations;
 @RunWith(Enclosed.class)
 public class DatastoreV1Test {
   private static final String PROJECT_ID = "testProject";
+  private static final String DATABASE_ID = "";
   private static final String NAMESPACE = "testNamespace";
   private static final String KIND = "testKind";
   private static final Query QUERY;
@@ -138,7 +139,7 @@ public class DatastoreV1Test {
     Query.Builder q = Query.newBuilder();
     q.addKindBuilder().setName(KIND);
     QUERY = q.build();
-    V_1_OPTIONS = V1Options.from(PROJECT_ID, NAMESPACE, null);
+    V_1_OPTIONS = V1Options.from(PROJECT_ID, StaticValueProvider.of(DATABASE_ID), NAMESPACE, null);
   }
 
   @Mock protected Datastore mockDatastore;
@@ -152,6 +153,9 @@ public class DatastoreV1Test {
     MockitoAnnotations.initMocks(this);
 
     when(mockDatastoreFactory.getDatastore(any(PipelineOptions.class), any(String.class), any()))
+        .thenReturn(mockDatastore);
+    when(mockDatastoreFactory.getDatastore(
+            any(PipelineOptions.class), any(String.class), any(String.class), any()))
         .thenReturn(mockDatastore);
     when(mockDatastoreFactory.getQuerySplitter()).thenReturn(mockQuerySplitter);
     // Setup the ProcessWideContainer for testing metrics are set.
@@ -167,10 +171,12 @@ public class DatastoreV1Test {
           DatastoreIO.v1()
               .read()
               .withProjectId(PROJECT_ID)
+              .withDatabaseId(DATABASE_ID)
               .withQuery(QUERY)
               .withNamespace(NAMESPACE);
       assertEquals(QUERY, read.getQuery());
       assertEquals(PROJECT_ID, read.getProjectId().get());
+      assertEquals(DATABASE_ID, read.getDatabaseId().get());
       assertEquals(NAMESPACE, read.getNamespace().get());
     }
 
@@ -180,11 +186,13 @@ public class DatastoreV1Test {
           DatastoreIO.v1()
               .read()
               .withProjectId(PROJECT_ID)
+              .withDatabaseId(DATABASE_ID)
               .withQuery(QUERY)
               .withReadTime(TIMESTAMP);
       assertEquals(TIMESTAMP, read.getReadTime());
       assertEquals(QUERY, read.getQuery());
       assertEquals(PROJECT_ID, read.getProjectId().get());
+      assertEquals(DATABASE_ID, read.getDatabaseId().get());
     }
 
     @Test
@@ -193,10 +201,12 @@ public class DatastoreV1Test {
           DatastoreIO.v1()
               .read()
               .withProjectId(PROJECT_ID)
+              .withDatabaseId(DATABASE_ID)
               .withLiteralGqlQuery(GQL_QUERY)
               .withNamespace(NAMESPACE);
       assertEquals(GQL_QUERY, read.getLiteralGqlQuery().get());
       assertEquals(PROJECT_ID, read.getProjectId().get());
+      assertEquals(DATABASE_ID, read.getDatabaseId().get());
       assertEquals(NAMESPACE, read.getNamespace().get());
     }
 
@@ -210,10 +220,12 @@ public class DatastoreV1Test {
               .withQuery(QUERY)
               .withNamespace(NAMESPACE)
               .withProjectId(PROJECT_ID)
+              .withDatabaseId(DATABASE_ID)
               .withLocalhost(LOCALHOST);
       assertEquals(TIMESTAMP, read.getReadTime());
       assertEquals(QUERY, read.getQuery());
       assertEquals(PROJECT_ID, read.getProjectId().get());
+      assertEquals(DATABASE_ID, read.getDatabaseId().get());
       assertEquals(NAMESPACE, read.getNamespace().get());
       assertEquals(LOCALHOST, read.getLocalhost());
     }
@@ -224,6 +236,7 @@ public class DatastoreV1Test {
           DatastoreIO.v1()
               .read()
               .withProjectId(PROJECT_ID)
+              .withDatabaseId(DATABASE_ID)
               .withLiteralGqlQuery(GQL_QUERY)
               .withQuery(QUERY);
 
@@ -257,6 +270,7 @@ public class DatastoreV1Test {
           DatastoreIO.v1()
               .read()
               .withProjectId(PROJECT_ID)
+              .withDatabaseId(DATABASE_ID)
               .withQuery(QUERY)
               .withNamespace(NAMESPACE)
               .withReadTime(TIMESTAMP);
@@ -264,6 +278,7 @@ public class DatastoreV1Test {
       DisplayData displayData = DisplayData.from(read);
 
       assertThat(displayData, hasDisplayItem("projectId", PROJECT_ID));
+      assertThat(displayData, hasDisplayItem("databaseId", DATABASE_ID));
       assertThat(displayData, hasDisplayItem("query", QUERY.toString()));
       assertThat(displayData, hasDisplayItem("namespace", NAMESPACE));
       assertThat(displayData, hasDisplayItem("readTime", TIMESTAMP));
@@ -275,6 +290,7 @@ public class DatastoreV1Test {
           DatastoreIO.v1()
               .read()
               .withProjectId(PROJECT_ID)
+              .withDatabaseId(DATABASE_ID)
               .withLiteralGqlQuery(GQL_QUERY)
               .withNamespace(NAMESPACE)
               .withReadTime(TIMESTAMP);
@@ -295,6 +311,7 @@ public class DatastoreV1Test {
           DatastoreIO.v1()
               .read()
               .withProjectId(PROJECT_ID)
+              .withDatabaseId(DATABASE_ID)
               .withQuery(Query.newBuilder().build())
               .withNumQuerySplits(numSplits);
 
@@ -313,29 +330,34 @@ public class DatastoreV1Test {
 
     @Test
     public void testWriteDisplayData() {
-      Write write = DatastoreIO.v1().write().withProjectId(PROJECT_ID);
+      Write write = DatastoreIO.v1().write().withProjectId(PROJECT_ID).withDatabaseId(DATABASE_ID);
 
       DisplayData displayData = DisplayData.from(write);
 
       assertThat(displayData, hasDisplayItem("projectId", PROJECT_ID));
+      assertThat(displayData, hasDisplayItem("databaseId", DATABASE_ID));
     }
 
     @Test
     public void testDeleteEntityDisplayData() {
-      DeleteEntity deleteEntity = DatastoreIO.v1().deleteEntity().withProjectId(PROJECT_ID);
+      DeleteEntity deleteEntity =
+          DatastoreIO.v1().deleteEntity().withProjectId(PROJECT_ID).withDatabaseId(DATABASE_ID);
 
       DisplayData displayData = DisplayData.from(deleteEntity);
 
       assertThat(displayData, hasDisplayItem("projectId", PROJECT_ID));
+      assertThat(displayData, hasDisplayItem("databaseId", DATABASE_ID));
     }
 
     @Test
     public void testDeleteKeyDisplayData() {
-      DeleteKey deleteKey = DatastoreIO.v1().deleteKey().withProjectId(PROJECT_ID);
+      DeleteKey deleteKey =
+          DatastoreIO.v1().deleteKey().withProjectId(PROJECT_ID).withDatabaseId(DATABASE_ID);
 
       DisplayData displayData = DisplayData.from(deleteKey);
 
       assertThat(displayData, hasDisplayItem("projectId", PROJECT_ID));
+      assertThat(displayData, hasDisplayItem("databaseId", DATABASE_ID));
     }
 
     @Test
@@ -586,26 +608,42 @@ public class DatastoreV1Test {
             makeUpsert(Entity.newBuilder().setKey(makeKey("key" + i, i + 1)).build()).build());
       }
 
+      int start = 0;
+      ArgumentCaptor<CommitRequest> requestCaptor = ArgumentCaptor.forClass(CommitRequest.class);
+      CommitResponse response = CommitResponse.getDefaultInstance();
+      while (start < numMutations) {
+        int end = Math.min(numMutations, start + DatastoreV1.DATASTORE_BATCH_UPDATE_ENTITIES_START);
+        when(mockDatastore.commit(requestCaptor.capture())).thenReturn(response);
+        start = end;
+      }
+
       DatastoreWriterFn datastoreWriter =
           new DatastoreWriterFn(
               StaticValueProvider.of(PROJECT_ID),
               null,
               mockDatastoreFactory,
               new FakeWriteBatcher());
-      DoFnTester<Mutation, Void> doFnTester = DoFnTester.of(datastoreWriter);
+      DoFnTester<Mutation, DatastoreV1.WriteSuccessSummary> doFnTester =
+          DoFnTester.of(datastoreWriter);
       doFnTester.setCloningBehavior(CloningBehavior.DO_NOT_CLONE);
       doFnTester.processBundle(mutations);
 
-      int start = 0;
+      start = 0;
+      List<CommitRequest> requests = new ArrayList<>();
       while (start < numMutations) {
         int end = Math.min(numMutations, start + DatastoreV1.DATASTORE_BATCH_UPDATE_ENTITIES_START);
         CommitRequest.Builder commitRequest = CommitRequest.newBuilder();
+        commitRequest.setProjectId(PROJECT_ID);
+        commitRequest.setDatabaseId(DATABASE_ID);
         commitRequest.setMode(CommitRequest.Mode.NON_TRANSACTIONAL);
         commitRequest.addAllMutations(mutations.subList(start, end));
         // Verify all the batch requests were made with the expected mutations.
-        verify(mockDatastore, times(1)).commit(commitRequest.build());
+        CommitRequest expectedRequest = commitRequest.build();
+        verify(mockDatastore, times(1)).commit(expectedRequest);
+        requests.add(expectedRequest);
         start = end;
       }
+      assertTrue(requestCaptor.getAllValues().containsAll(requests));
     }
 
     /**
@@ -627,29 +665,45 @@ public class DatastoreV1Test {
         mutations.add(makeUpsert(entity).build());
       }
 
+      int entitiesPerRpc = DATASTORE_BATCH_UPDATE_BYTES_LIMIT / entitySize;
+      int start = 0;
+      ArgumentCaptor<CommitRequest> requestCaptor = ArgumentCaptor.forClass(CommitRequest.class);
+      CommitResponse response = CommitResponse.getDefaultInstance();
+      while (start < mutations.size()) {
+        int end = Math.min(mutations.size(), start + entitiesPerRpc);
+        when(mockDatastore.commit(requestCaptor.capture())).thenReturn(response);
+        start = end;
+      }
+
       DatastoreWriterFn datastoreWriter =
           new DatastoreWriterFn(
               StaticValueProvider.of(PROJECT_ID),
               null,
               mockDatastoreFactory,
               new FakeWriteBatcher());
-      DoFnTester<Mutation, Void> doFnTester = DoFnTester.of(datastoreWriter);
+      DoFnTester<Mutation, DatastoreV1.WriteSuccessSummary> doFnTester =
+          DoFnTester.of(datastoreWriter);
       doFnTester.setCloningBehavior(CloningBehavior.DO_NOT_CLONE);
       doFnTester.processBundle(mutations);
 
       // This test is over-specific currently; it requires that we split the 12 entity writes into 3
       // requests, but we only need each CommitRequest to be less than 10MB in size.
-      int entitiesPerRpc = DATASTORE_BATCH_UPDATE_BYTES_LIMIT / entitySize;
-      int start = 0;
+      start = 0;
+      List<CommitRequest> requests = new ArrayList<>();
       while (start < mutations.size()) {
         int end = Math.min(mutations.size(), start + entitiesPerRpc);
         CommitRequest.Builder commitRequest = CommitRequest.newBuilder();
+        commitRequest.setProjectId(PROJECT_ID);
+        commitRequest.setDatabaseId(DATABASE_ID);
         commitRequest.setMode(CommitRequest.Mode.NON_TRANSACTIONAL);
         commitRequest.addAllMutations(mutations.subList(start, end));
         // Verify all the batch requests were made with the expected mutations.
-        verify(mockDatastore).commit(commitRequest.build());
+        CommitRequest expectedRequest = commitRequest.build();
+        verify(mockDatastore).commit(expectedRequest);
+        requests.add(expectedRequest);
         start = end;
       }
+      assertTrue(requestCaptor.getAllValues().containsAll(requests));
     }
 
     /** Tests {@link DatastoreWriterFn} correctly flushes batch upon receive same entity keys. */
@@ -667,13 +721,18 @@ public class DatastoreV1Test {
                 .build());
       }
 
+      ArgumentCaptor<CommitRequest> requestCaptor = ArgumentCaptor.forClass(CommitRequest.class);
+      CommitResponse response = CommitResponse.getDefaultInstance();
+      when(mockDatastore.commit(requestCaptor.capture())).thenReturn(response).thenReturn(response);
+
       DatastoreWriterFn datastoreWriter =
           new DatastoreWriterFn(
               StaticValueProvider.of(PROJECT_ID),
               null,
               mockDatastoreFactory,
               new FakeWriteBatcher());
-      DoFnTester<Mutation, Void> doFnTester = DoFnTester.of(datastoreWriter);
+      DoFnTester<Mutation, DatastoreV1.WriteSuccessSummary> doFnTester =
+          DoFnTester.of(datastoreWriter);
       doFnTester.setCloningBehavior(CloningBehavior.DO_NOT_CLONE);
       doFnTester.processBundle(mutations);
 
@@ -681,14 +740,25 @@ public class DatastoreV1Test {
       CommitRequest.Builder commitRequest = CommitRequest.newBuilder();
       commitRequest.setMode(CommitRequest.Mode.NON_TRANSACTIONAL);
       commitRequest.addAllMutations(mutations.subList(0, 2));
-      verify(mockDatastore, times(1)).commit(commitRequest.build());
+      commitRequest.setProjectId(PROJECT_ID);
+      commitRequest.setDatabaseId(DATABASE_ID);
+      CommitRequest expectedRequest1 = commitRequest.build();
+      verify(mockDatastore, times(1)).commit(expectedRequest1);
 
       // second invocation has key [0, 2] because the second 0 triggered a flush batch
       commitRequest = CommitRequest.newBuilder();
       commitRequest.setMode(CommitRequest.Mode.NON_TRANSACTIONAL);
       commitRequest.addAllMutations(mutations.subList(2, 4));
-      verify(mockDatastore, times(1)).commit(commitRequest.build());
+      commitRequest.setProjectId(PROJECT_ID);
+      commitRequest.setDatabaseId(DATABASE_ID);
+      CommitRequest expectedRequest2 = commitRequest.build();
+      verify(mockDatastore, times(1)).commit(expectedRequest2);
       verifyMetricWasSet("BatchDatastoreWrite", "ok", "", 2);
+
+      assertTrue(
+          requestCaptor
+              .getAllValues()
+              .containsAll(Arrays.asList(expectedRequest1, expectedRequest2)));
     }
 
     /** Tests {@link DatastoreWriterFn} with a failed request which is retried. */
@@ -713,7 +783,8 @@ public class DatastoreV1Test {
               null,
               mockDatastoreFactory,
               new FakeWriteBatcher());
-      DoFnTester<Mutation, Void> doFnTester = DoFnTester.of(datastoreWriter);
+      DoFnTester<Mutation, DatastoreV1.WriteSuccessSummary> doFnTester =
+          DoFnTester.of(datastoreWriter);
       doFnTester.setCloningBehavior(CloningBehavior.DO_NOT_CLONE);
       doFnTester.processBundle(mutations);
       verifyMetricWasSet("BatchDatastoreWrite", "ok", "", 2);
@@ -841,17 +912,26 @@ public class DatastoreV1Test {
       long timestamp = 1234L;
 
       RunQueryRequest latestTimestampRequest =
-          makeRequest(makeLatestTimestampQuery(NAMESPACE), NAMESPACE, readTime);
+          makeRequest(
+              PROJECT_ID, DATABASE_ID, makeLatestTimestampQuery(NAMESPACE), NAMESPACE, readTime);
       RunQueryResponse latestTimestampResponse = makeLatestTimestampResponse(timestamp);
       // Per Kind statistics request and response
       RunQueryRequest statRequest =
-          makeRequest(makeStatKindQuery(NAMESPACE, timestamp), NAMESPACE, readTime);
+          makeRequest(
+              PROJECT_ID,
+              DATABASE_ID,
+              makeStatKindQuery(NAMESPACE, timestamp),
+              NAMESPACE,
+              readTime);
       RunQueryResponse statResponse = makeStatKindResponse(entityBytes);
 
       when(mockDatastore.runQuery(latestTimestampRequest)).thenReturn(latestTimestampResponse);
       when(mockDatastore.runQuery(statRequest)).thenReturn(statResponse);
 
-      assertEquals(entityBytes, getEstimatedSizeBytes(mockDatastore, QUERY, NAMESPACE, readTime));
+      assertEquals(
+          entityBytes,
+          getEstimatedSizeBytes(
+              mockDatastore, PROJECT_ID, DATABASE_ID, QUERY, NAMESPACE, readTime));
       verify(mockDatastore, times(1)).runQuery(latestTimestampRequest);
       verify(mockDatastore, times(1)).runQuery(statRequest);
     }
@@ -903,7 +983,7 @@ public class DatastoreV1Test {
                 any(Datastore.class),
                 eq(readTimeProto));
       }
-      verifyZeroInteractions(mockDatastore);
+      verifyNoInteractions(mockDatastore);
     }
 
     /** Tests {@link SplitQueryFn} when no query splits is specified. */
@@ -917,12 +997,18 @@ public class DatastoreV1Test {
       long timestamp = 1234L;
 
       RunQueryRequest latestTimestampRequest =
-          makeRequest(makeLatestTimestampQuery(NAMESPACE), NAMESPACE, readTime);
+          makeRequest(
+              PROJECT_ID, DATABASE_ID, makeLatestTimestampQuery(NAMESPACE), NAMESPACE, readTime);
       RunQueryResponse latestTimestampResponse = makeLatestTimestampResponse(timestamp);
 
       // Per Kind statistics request and response
       RunQueryRequest statRequest =
-          makeRequest(makeStatKindQuery(NAMESPACE, timestamp), NAMESPACE, readTime);
+          makeRequest(
+              PROJECT_ID,
+              DATABASE_ID,
+              makeStatKindQuery(NAMESPACE, timestamp),
+              NAMESPACE,
+              readTime);
       RunQueryResponse statResponse = makeStatKindResponse(entityBytes);
 
       when(mockDatastore.runQuery(latestTimestampRequest)).thenReturn(latestTimestampResponse);
@@ -1030,9 +1116,11 @@ public class DatastoreV1Test {
       GqlQuery gqlQueryWithZeroLimit =
           GqlQuery.newBuilder().setQueryString(gqlWithZeroLimit).setAllowLiterals(true).build();
 
-      RunQueryRequest gqlRequest = makeRequest(gqlQuery, V_1_OPTIONS.getNamespace(), readTime);
+      RunQueryRequest gqlRequest =
+          makeRequest(PROJECT_ID, DATABASE_ID, gqlQuery, V_1_OPTIONS.getNamespace(), readTime);
       RunQueryRequest gqlRequestWithZeroLimit =
-          makeRequest(gqlQueryWithZeroLimit, V_1_OPTIONS.getNamespace(), readTime);
+          makeRequest(
+              PROJECT_ID, DATABASE_ID, gqlQueryWithZeroLimit, V_1_OPTIONS.getNamespace(), readTime);
       when(mockDatastore.runQuery(gqlRequestWithZeroLimit))
           .thenThrow(
               new DatastoreException(
@@ -1044,7 +1132,8 @@ public class DatastoreV1Test {
       when(mockDatastore.runQuery(gqlRequest))
           .thenReturn(RunQueryResponse.newBuilder().setQuery(QUERY).build());
       assertEquals(
-          translateGqlQueryWithLimitCheck(gql, mockDatastore, V_1_OPTIONS.getNamespace(), readTime),
+          translateGqlQueryWithLimitCheck(
+              gql, mockDatastore, PROJECT_ID, DATABASE_ID, V_1_OPTIONS.getNamespace(), readTime),
           QUERY);
       verify(mockDatastore, times(1)).runQuery(gqlRequest);
       verify(mockDatastore, times(1)).runQuery(gqlRequestWithZeroLimit);
@@ -1058,11 +1147,18 @@ public class DatastoreV1Test {
           GqlQuery.newBuilder().setQueryString(gqlWithZeroLimit).setAllowLiterals(true).build();
 
       RunQueryRequest gqlRequestWithZeroLimit =
-          makeRequest(gqlQueryWithZeroLimit, V_1_OPTIONS.getNamespace(), readTime);
+          makeRequest(
+              PROJECT_ID, DATABASE_ID, gqlQueryWithZeroLimit, V_1_OPTIONS.getNamespace(), readTime);
       when(mockDatastore.runQuery(gqlRequestWithZeroLimit))
           .thenReturn(RunQueryResponse.newBuilder().setQuery(QUERY).build());
       assertEquals(
-          translateGqlQueryWithLimitCheck(gql, mockDatastore, V_1_OPTIONS.getNamespace(), readTime),
+          translateGqlQueryWithLimitCheck(
+              gql,
+              mockDatastore,
+              V_1_OPTIONS.getProjectId(),
+              V_1_OPTIONS.getDatabaseId(),
+              V_1_OPTIONS.getNamespace(),
+              readTime),
           QUERY);
       verify(mockDatastore, times(1)).runQuery(gqlRequestWithZeroLimit);
     }
@@ -1074,13 +1170,20 @@ public class DatastoreV1Test {
       GqlQuery gqlQueryWithZeroLimit =
           GqlQuery.newBuilder().setQueryString(gqlWithZeroLimit).setAllowLiterals(true).build();
       RunQueryRequest gqlRequestWithZeroLimit =
-          makeRequest(gqlQueryWithZeroLimit, V_1_OPTIONS.getNamespace(), readTime);
+          makeRequest(
+              PROJECT_ID, DATABASE_ID, gqlQueryWithZeroLimit, V_1_OPTIONS.getNamespace(), readTime);
       when(mockDatastore.runQuery(gqlRequestWithZeroLimit))
           .thenThrow(new RuntimeException("TestException"));
 
       thrown.expect(RuntimeException.class);
       thrown.expectMessage("TestException");
-      translateGqlQueryWithLimitCheck(gql, mockDatastore, V_1_OPTIONS.getNamespace(), readTime);
+      translateGqlQueryWithLimitCheck(
+          gql,
+          mockDatastore,
+          V_1_OPTIONS.getProjectId(),
+          V_1_OPTIONS.getDatabaseId(),
+          V_1_OPTIONS.getNamespace(),
+          readTime);
     }
   }
 

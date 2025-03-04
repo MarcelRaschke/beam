@@ -72,6 +72,7 @@ from typing import Any
 from typing import ByteString
 from typing import Dict
 from typing import Generic
+from typing import Iterable
 from typing import List
 from typing import Mapping
 from typing import NamedTuple
@@ -87,10 +88,12 @@ from google.protobuf import text_format
 from apache_beam.portability import common_urns
 from apache_beam.portability.api import schema_pb2
 from apache_beam.typehints import row_type
+from apache_beam.typehints import typehints
 from apache_beam.typehints.native_type_compatibility import _get_args
 from apache_beam.typehints.native_type_compatibility import _match_is_exactly_mapping
 from apache_beam.typehints.native_type_compatibility import _match_is_optional
 from apache_beam.typehints.native_type_compatibility import _safe_issubclass
+from apache_beam.typehints.native_type_compatibility import convert_to_python_type
 from apache_beam.typehints.native_type_compatibility import extract_optional_type
 from apache_beam.typehints.native_type_compatibility import match_is_named_tuple
 from apache_beam.typehints.schema_registry import SCHEMA_REGISTRY
@@ -225,6 +228,17 @@ def option_from_runner_api(
       schema_registry=schema_registry).option_from_runner_api(option_proto)
 
 
+def schema_field(
+    name: str,
+    field_type: Union[schema_pb2.FieldType, type],
+    description: Optional[str] = None) -> schema_pb2.Field:
+  return schema_pb2.Field(
+      name=name,
+      type=field_type if isinstance(field_type, schema_pb2.FieldType) else
+      typing_to_runner_api(field_type),
+      description=description)
+
+
 class SchemaTranslation(object):
   def __init__(self, schema_registry: SchemaTypeRegistry = SCHEMA_REGISTRY):
     self.schema_registry = schema_registry
@@ -232,6 +246,10 @@ class SchemaTranslation(object):
   def typing_to_runner_api(self, type_: type) -> schema_pb2.FieldType:
     if isinstance(type_, schema_pb2.Schema):
       return schema_pb2.FieldType(row_type=schema_pb2.RowType(schema=type_))
+
+    if hasattr(type_, '_beam_schema_proto') and type_._beam_schema_proto.obj:
+      return schema_pb2.FieldType(
+          row_type=schema_pb2.RowType(schema=type_._beam_schema_proto.obj))
 
     if isinstance(type_, row_type.RowTypeConstraint):
       if type_.schema_id is None:
@@ -256,6 +274,7 @@ class SchemaTranslation(object):
                         self.option_to_runner_api(option_tuple)
                         for option_tuple in type_.field_options(field_name)
                     ],
+                    description=type_._field_descriptions.get(field_name, None),
                 ) for (field_name, field_type) in type_._fields
             ],
             id=schema_id,
@@ -272,6 +291,9 @@ class SchemaTranslation(object):
       row_type_constraint = row_type.RowTypeConstraint.from_user_type(type_)
       if row_type_constraint is not None:
         return self.typing_to_runner_api(row_type_constraint)
+
+    if isinstance(type_, typehints.TypeConstraint):
+      type_ = convert_to_python_type(type_)
 
     # All concrete types (other than NamedTuple sub-classes) should map to
     # a supported primitive type.
@@ -306,6 +328,11 @@ class SchemaTranslation(object):
       key_type, value_type = map(self.typing_to_runner_api, _get_args(type_))
       return schema_pb2.FieldType(
           map_type=schema_pb2.MapType(key_type=key_type, value_type=value_type))
+
+    elif _safe_issubclass(type_, Iterable) and not _safe_issubclass(type_, str):
+      element_type = self.typing_to_runner_api(_get_args(type_)[0])
+      return schema_pb2.FieldType(
+          array_type=schema_pb2.ArrayType(element_type=element_type))
 
     try:
       logical_type = LogicalType.from_typing(type_)
@@ -486,13 +513,17 @@ class SchemaTranslation(object):
         # generate a NamedTuple type to use.
 
         fields = named_fields_from_schema(schema)
+        descriptions = {
+            field.name: field.description
+            for field in schema.fields
+        }
         result = row_type.RowTypeConstraint.from_fields(
             fields=fields,
             schema_id=schema.id,
             schema_options=schema_options,
             field_options=field_options,
             schema_registry=self.schema_registry,
-        )
+            field_descriptions=descriptions or None)
         return result
       else:
         return row_type.RowTypeConstraint.from_user_type(
@@ -516,6 +547,7 @@ class SchemaTranslation(object):
     type_name = 'BeamSchema_{}'.format(schema.id.replace('-', '_'))
 
     subfields = []
+    descriptions = {}
     for field in schema.fields:
       try:
         field_py_type = self.typing_from_runner_api(field.type)
@@ -526,6 +558,7 @@ class SchemaTranslation(object):
             "Failed to decode schema due to an issue with Field proto:\n\n"
             f"{text_format.MessageToString(field)}") from e
 
+      descriptions[field.name] = field.description
       subfields.append((field.name, field_py_type))
 
     user_type = NamedTuple(type_name, subfields)
@@ -536,6 +569,7 @@ class SchemaTranslation(object):
         user_type,
         '__reduce__',
         _named_tuple_reduce_method(schema.SerializeToString()))
+    setattr(user_type, "_field_descriptions", descriptions)
     setattr(user_type, row_type._BEAM_SCHEMA_ID, schema.id)
 
     self.schema_registry.add(user_type, schema)
@@ -588,6 +622,34 @@ def named_fields_from_element_type(
   return named_fields_from_schema(schema_from_element_type(element_type))
 
 
+def union_schema_type(element_types):
+  """Returns a schema whose fields are the union of each corresponding field.
+
+  element_types must be a set of schema-aware types whose fields have the
+  same naming and ordering.
+  """
+  union_fields_and_types = []
+  for field in zip(*[named_fields_from_element_type(t) for t in element_types]):
+    names, types = zip(*field)
+    name_set = set(names)
+    if len(name_set) != 1:
+      raise TypeError(
+          f"Could not determine schema for type hints {element_types!r}: "
+          f"Inconsistent names: {name_set}")
+    union_fields_and_types.append(
+        (next(iter(name_set)), typehints.Union[types]))
+  return named_tuple_from_schema(named_fields_to_schema(union_fields_and_types))
+
+
+class _Ephemeral:
+  """Helper class for wrapping unpicklable objects."""
+  def __init__(self, obj):
+    self.obj = obj
+
+  def __reduce__(self):
+    return _Ephemeral, (None, )
+
+
 # Registry of typings for a schema by UUID
 class LogicalTypeRegistry(object):
   def __init__(self):
@@ -608,6 +670,13 @@ class LogicalTypeRegistry(object):
 
   def get_logical_type_by_language_type(self, representation_type):
     return self.by_language_type.get(representation_type, None)
+
+  def copy(self):
+    copy = LogicalTypeRegistry()
+    copy.by_urn.update(self.by_urn)
+    copy.by_logical_type.update(self.by_logical_type)
+    copy.by_language_type.update(self.by_language_type)
+    return copy
 
 
 LanguageT = TypeVar('LanguageT')

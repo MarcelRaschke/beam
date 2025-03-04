@@ -21,23 +21,54 @@
 
 import json
 import logging
+import os
 import unittest
 
 import hamcrest as hc
+import mock
+from parameterized import parameterized
 
+from apache_beam.options.pipeline_options import CrossLanguageOptions
 from apache_beam.options.pipeline_options import DebugOptions
 from apache_beam.options.pipeline_options import GoogleCloudOptions
+from apache_beam.options.pipeline_options import JobServerOptions
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import ProfilingOptions
 from apache_beam.options.pipeline_options import TypeOptions
 from apache_beam.options.pipeline_options import WorkerOptions
 from apache_beam.options.pipeline_options import _BeamArgumentParser
+from apache_beam.options.pipeline_options_validator import PipelineOptionsValidator
 from apache_beam.options.value_provider import RuntimeValueProvider
 from apache_beam.options.value_provider import StaticValueProvider
 from apache_beam.transforms.display import DisplayData
 from apache_beam.transforms.display_test import DisplayDataItemMatcher
 
 _LOGGER = logging.getLogger(__name__)
+
+try:
+  import apache_beam.io.gcp.gcsio  # pylint: disable=unused-import
+  has_gcsio = True
+except ImportError:
+  has_gcsio = False
+
+
+# Mock runners to use for validations.
+class MockRunners(object):
+  class DataflowRunner(object):
+    def get_default_gcp_region(self):
+      # Return a default so we don't have to specify --region in every test
+      # (unless specifically testing it).
+      return 'us-central1'
+
+
+class MockGoogleCloudOptionsNoBucket(GoogleCloudOptions):
+  def _create_default_gcs_bucket(self):
+    return None
+
+
+class MockGoogleCloudOptionsWithBucket(GoogleCloudOptions):
+  def _create_default_gcs_bucket(self):
+    return "gs://default/bucket"
 
 
 class PipelineOptionsTest(unittest.TestCase):
@@ -52,150 +83,104 @@ class PipelineOptionsTest(unittest.TestCase):
     RuntimeValueProvider.set_runtime_options(None)
 
   TEST_CASES = [
-      {
-          'flags': ['--num_workers', '5'],
-          'expected': {
-              'num_workers': 5,
-              'mock_flag': False,
-              'mock_option': None,
-              'mock_multi_option': None
-          },
-          'display_data': [DisplayDataItemMatcher('num_workers', 5)]
-      },
-      {
-          'flags': ['--direct_num_workers', '5'],
-          'expected': {
-              'direct_num_workers': 5,
-              'mock_flag': False,
-              'mock_option': None,
-              'mock_multi_option': None
-          },
-          'display_data': [DisplayDataItemMatcher('direct_num_workers', 5)]
-      },
-      {
-          'flags': ['--direct_running_mode', 'multi_threading'],
-          'expected': {
-              'direct_running_mode': 'multi_threading',
-              'mock_flag': False,
-              'mock_option': None,
-              'mock_multi_option': None
-          },
-          'display_data': [
-              DisplayDataItemMatcher('direct_running_mode', 'multi_threading')
-          ]
-      },
-      {
-          'flags': ['--direct_running_mode', 'multi_processing'],
-          'expected': {
-              'direct_running_mode': 'multi_processing',
-              'mock_flag': False,
-              'mock_option': None,
-              'mock_multi_option': None
-          },
-          'display_data': [
-              DisplayDataItemMatcher('direct_running_mode', 'multi_processing')
-          ]
-      },
-      {
-          'flags': [
-              '--profile_cpu', '--profile_location', 'gs://bucket/', 'ignored'
-          ],
-          'expected': {
-              'profile_cpu': True,
-              'profile_location': 'gs://bucket/',
-              'mock_flag': False,
-              'mock_option': None,
-              'mock_multi_option': None
-          },
-          'display_data': [
-              DisplayDataItemMatcher('profile_cpu', True),
-              DisplayDataItemMatcher('profile_location', 'gs://bucket/')
-          ]
-      },
-      {
-          'flags': ['--num_workers', '5', '--mock_flag'],
-          'expected': {
-              'num_workers': 5,
-              'mock_flag': True,
-              'mock_option': None,
-              'mock_multi_option': None
-          },
-          'display_data': [
-              DisplayDataItemMatcher('num_workers', 5),
-              DisplayDataItemMatcher('mock_flag', True)
-          ]
-      },
-      {
-          'flags': ['--mock_option', 'abc'],
-          'expected': {
-              'mock_flag': False,
-              'mock_option': 'abc',
-              'mock_multi_option': None
-          },
-          'display_data': [DisplayDataItemMatcher('mock_option', 'abc')]
-      },
-      {
-          'flags': ['--mock_option', ' abc def '],
-          'expected': {
-              'mock_flag': False,
-              'mock_option': ' abc def ',
-              'mock_multi_option': None
-          },
-          'display_data': [DisplayDataItemMatcher('mock_option', ' abc def ')]
-      },
-      {
-          'flags': ['--mock_option= abc xyz '],
-          'expected': {
-              'mock_flag': False,
-              'mock_option': ' abc xyz ',
-              'mock_multi_option': None
-          },
-          'display_data': [DisplayDataItemMatcher('mock_option', ' abc xyz ')]
-      },
-      {
-          'flags': [
-              '--mock_option=gs://my bucket/my folder/my file',
-              '--mock_multi_option=op1',
-              '--mock_multi_option=op2'
-          ],
-          'expected': {
-              'mock_flag': False,
-              'mock_option': 'gs://my bucket/my folder/my file',
-              'mock_multi_option': ['op1', 'op2']
-          },
-          'display_data': [
-              DisplayDataItemMatcher(
-                  'mock_option', 'gs://my bucket/my folder/my file'),
-              DisplayDataItemMatcher('mock_multi_option', ['op1', 'op2'])
-          ]
-      },
-      {
-          'flags': ['--mock_multi_option=op1', '--mock_multi_option=op2'],
-          'expected': {
-              'mock_flag': False,
-              'mock_option': None,
-              'mock_multi_option': ['op1', 'op2']
-          },
-          'display_data': [
-              DisplayDataItemMatcher('mock_multi_option', ['op1', 'op2'])
-          ]
-      },
-      {
-          'flags': ['--mock_json_option={"11a": 0, "37a": 1}'],
-          'expected': {
-              'mock_flag': False,
-              'mock_option': None,
-              'mock_multi_option': None,
-              'mock_json_option': {
-                  '11a': 0, '37a': 1
-              },
-          },
-          'display_data': [
-              DisplayDataItemMatcher('mock_json_option', {
-                  '11a': 0, '37a': 1
-              })
-          ]
-      },
+      (['--num_workers', '5'],
+       {
+           'num_workers': 5,
+           'mock_flag': False,
+           'mock_option': None,
+           'mock_multi_option': None
+       }, [DisplayDataItemMatcher('num_workers', 5)]),
+      (['--direct_num_workers', '5'],
+       {
+           'direct_num_workers': 5,
+           'mock_flag': False,
+           'mock_option': None,
+           'mock_multi_option': None
+       }, [DisplayDataItemMatcher('direct_num_workers', 5)]),
+      (['--direct_running_mode', 'multi_threading'],
+       {
+           'direct_running_mode': 'multi_threading',
+           'mock_flag': False,
+           'mock_option': None,
+           'mock_multi_option': None
+       }, [DisplayDataItemMatcher('direct_running_mode', 'multi_threading')]),
+      (['--direct_running_mode', 'multi_processing'],
+       {
+           'direct_running_mode': 'multi_processing',
+           'mock_flag': False,
+           'mock_option': None,
+           'mock_multi_option': None
+       }, [DisplayDataItemMatcher('direct_running_mode', 'multi_processing')]),
+      (['--profile_cpu', '--profile_location', 'gs://bucket/', 'ignored'],
+       {
+           'profile_cpu': True,
+           'profile_location': 'gs://bucket/',
+           'mock_flag': False,
+           'mock_option': None,
+           'mock_multi_option': None
+       },
+       [
+           DisplayDataItemMatcher('profile_cpu', True),
+           DisplayDataItemMatcher('profile_location', 'gs://bucket/')
+       ]),
+      (['--num_workers', '5', '--mock_flag'],
+       {
+           'num_workers': 5,
+           'mock_flag': True,
+           'mock_option': None,
+           'mock_multi_option': None
+       },
+       [
+           DisplayDataItemMatcher('num_workers', 5),
+           DisplayDataItemMatcher('mock_flag', True)
+       ]),
+      (['--mock_option', 'abc'], {
+          'mock_flag': False, 'mock_option': 'abc', 'mock_multi_option': None
+      }, [DisplayDataItemMatcher('mock_option', 'abc')]),
+      (['--mock_option', ' abc def '],
+       {
+           'mock_flag': False,
+           'mock_option': ' abc def ',
+           'mock_multi_option': None
+       }, [DisplayDataItemMatcher('mock_option', ' abc def ')]),
+      (['--mock_option= abc xyz '],
+       {
+           'mock_flag': False,
+           'mock_option': ' abc xyz ',
+           'mock_multi_option': None
+       }, [DisplayDataItemMatcher('mock_option', ' abc xyz ')]),
+      ([
+          '--mock_option=gs://my bucket/my folder/my file',
+          '--mock_multi_option=op1',
+          '--mock_multi_option=op2'
+      ],
+       {
+           'mock_flag': False,
+           'mock_option': 'gs://my bucket/my folder/my file',
+           'mock_multi_option': ['op1', 'op2']
+       },
+       [
+           DisplayDataItemMatcher(
+               'mock_option', 'gs://my bucket/my folder/my file'),
+           DisplayDataItemMatcher('mock_multi_option', ['op1', 'op2'])
+       ]),
+      (['--mock_multi_option=op1', '--mock_multi_option=op2'],
+       {
+           'mock_flag': False,
+           'mock_option': None,
+           'mock_multi_option': ['op1', 'op2']
+       }, [DisplayDataItemMatcher('mock_multi_option', ['op1', 'op2'])]),
+      (['--mock_json_option={"11a": 0, "37a": 1}'],
+       {
+           'mock_flag': False,
+           'mock_option': None,
+           'mock_multi_option': None,
+           'mock_json_option': {
+               '11a': 0, '37a': 1
+           },
+       }, [DisplayDataItemMatcher('mock_json_option', {
+           '11a': 0, '37a': 1
+       })]),
   ]
 
   # Used for testing newly added flags.
@@ -218,59 +203,59 @@ class PipelineOptionsTest(unittest.TestCase):
       parser.add_argument(
           '--fake_multi_option', action='append', help='fake multi option')
 
-  def test_display_data(self):
-    for case in PipelineOptionsTest.TEST_CASES:
-      options = PipelineOptions(flags=case['flags'])
-      dd = DisplayData.create_from(options)
-      hc.assert_that(dd.items, hc.contains_inanyorder(*case['display_data']))
+  @parameterized.expand(TEST_CASES)
+  def test_display_data(self, flags, _, display_data):
+    options = PipelineOptions(flags=flags)
+    dd = DisplayData.create_from(options)
+    hc.assert_that(dd.items, hc.contains_inanyorder(*display_data))
 
-  def test_get_all_options_subclass(self):
-    for case in PipelineOptionsTest.TEST_CASES:
-      options = PipelineOptionsTest.MockOptions(flags=case['flags'])
-      self.assertDictContainsSubset(case['expected'], options.get_all_options())
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_flag,
-          case['expected']['mock_flag'])
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_option,
-          case['expected']['mock_option'])
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_multi_option,
-          case['expected']['mock_multi_option'])
+  @parameterized.expand(TEST_CASES)
+  def test_get_all_options_subclass(self, flags, expected, _):
+    options = PipelineOptionsTest.MockOptions(flags=flags)
+    self.assertLessEqual(expected.items(), options.get_all_options().items())
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_flag,
+        expected['mock_flag'])
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_option,
+        expected['mock_option'])
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_multi_option,
+        expected['mock_multi_option'])
 
-  def test_get_all_options(self):
-    for case in PipelineOptionsTest.TEST_CASES:
-      options = PipelineOptions(flags=case['flags'])
-      self.assertDictContainsSubset(case['expected'], options.get_all_options())
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_flag,
-          case['expected']['mock_flag'])
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_option,
-          case['expected']['mock_option'])
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_multi_option,
-          case['expected']['mock_multi_option'])
+  @parameterized.expand(TEST_CASES)
+  def test_get_all_options(self, flags, expected, _):
+    options = PipelineOptions(flags=flags)
+    self.assertLessEqual(expected.items(), options.get_all_options().items())
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_flag,
+        expected['mock_flag'])
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_option,
+        expected['mock_option'])
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_multi_option,
+        expected['mock_multi_option'])
 
-  def test_sublcalsses_of_pipeline_options_can_be_instantiated(self):
-    for case in PipelineOptionsTest.TEST_CASES:
-      mock_options = PipelineOptionsTest.MockOptions(flags=case['flags'])
-      self.assertEqual(mock_options.mock_flag, case['expected']['mock_flag'])
-      self.assertEqual(
-          mock_options.mock_option, case['expected']['mock_option'])
-      self.assertEqual(
-          mock_options.mock_multi_option, case['expected']['mock_multi_option'])
+  @parameterized.expand(TEST_CASES)
+  def test_subclasses_of_pipeline_options_can_be_instantiated(
+      self, flags, expected, _):
+    mock_options = PipelineOptionsTest.MockOptions(flags=flags)
+    self.assertEqual(mock_options.mock_flag, expected['mock_flag'])
+    self.assertEqual(mock_options.mock_option, expected['mock_option'])
+    self.assertEqual(
+        mock_options.mock_multi_option, expected['mock_multi_option'])
 
-  def test_views_can_be_constructed_from_pipeline_option_subclasses(self):
-    for case in PipelineOptionsTest.TEST_CASES:
-      fake_options = PipelineOptionsTest.FakeOptions(flags=case['flags'])
-      mock_options = fake_options.view_as(PipelineOptionsTest.MockOptions)
+  @parameterized.expand(TEST_CASES)
+  def test_views_can_be_constructed_from_pipeline_option_subclasses(
+      self, flags, expected, _):
+    fake_options = PipelineOptionsTest.FakeOptions(flags=flags)
+    mock_options = fake_options.view_as(PipelineOptionsTest.MockOptions)
 
-      self.assertEqual(mock_options.mock_flag, case['expected']['mock_flag'])
-      self.assertEqual(
-          mock_options.mock_option, case['expected']['mock_option'])
-      self.assertEqual(
-          mock_options.mock_multi_option, case['expected']['mock_multi_option'])
+    self.assertEqual(mock_options.mock_flag, expected['mock_flag'])
+    self.assertEqual(mock_options.mock_option, expected['mock_option'])
+    self.assertEqual(
+        mock_options.mock_multi_option, expected['mock_multi_option'])
 
   def test_views_do_not_expose_options_defined_by_other_views(self):
     flags = ['--mock_option=mock_value', '--fake_option=fake_value']
@@ -292,23 +277,23 @@ class PipelineOptionsTest(unittest.TestCase):
             PipelineOptionsTest.FakeOptions).view_as(
                 PipelineOptionsTest.MockOptions).fake_option)
 
-  def test_from_dictionary(self):
-    for case in PipelineOptionsTest.TEST_CASES:
-      options = PipelineOptions(flags=case['flags'])
-      all_options_dict = options.get_all_options()
-      options_from_dict = PipelineOptions.from_dictionary(all_options_dict)
-      self.assertEqual(
-          options_from_dict.view_as(PipelineOptionsTest.MockOptions).mock_flag,
-          case['expected']['mock_flag'])
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_option,
-          case['expected']['mock_option'])
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_multi_option,
-          case['expected']['mock_multi_option'])
-      self.assertEqual(
-          options.view_as(PipelineOptionsTest.MockOptions).mock_json_option,
-          case['expected'].get('mock_json_option', {}))
+  @parameterized.expand(TEST_CASES)
+  def test_from_dictionary(self, flags, expected, _):
+    options = PipelineOptions(flags=flags)
+    all_options_dict = options.get_all_options()
+    options_from_dict = PipelineOptions.from_dictionary(all_options_dict)
+    self.assertEqual(
+        options_from_dict.view_as(PipelineOptionsTest.MockOptions).mock_flag,
+        expected['mock_flag'])
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_option,
+        expected['mock_option'])
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_multi_option,
+        expected['mock_multi_option'])
+    self.assertEqual(
+        options.view_as(PipelineOptionsTest.MockOptions).mock_json_option,
+        expected.get('mock_json_option', {}))
 
   def test_none_from_dictionary(self):
     class NoneDefaultOptions(PipelineOptions):
@@ -419,6 +404,36 @@ class PipelineOptionsTest(unittest.TestCase):
     worker_options = options.view_as(WorkerOptions)
     self.assertEqual(worker_options.machine_type, 'abc')
     self.assertEqual(worker_options.disk_type, 'def')
+
+  def test_beam_services_empty(self):
+    with mock.patch.dict(os.environ, {}, clear=True):
+      options = PipelineOptions().view_as(CrossLanguageOptions)
+      self.assertEqual(options.beam_services, {})
+
+  def test_beam_services_from_env(self):
+    with mock.patch.dict(os.environ,
+                         {'BEAM_SERVICE_OVERRIDES': '{"foo": "bar"}'},
+                         clear=True):
+      options = PipelineOptions().view_as(CrossLanguageOptions)
+      self.assertEqual(options.beam_services, {'foo': 'bar'})
+
+  def test_beam_services_from_flag(self):
+    with mock.patch.dict(os.environ, {}, clear=True):
+      options = PipelineOptions(['--beam_services={"foo": "bar"}'
+                                 ]).view_as(CrossLanguageOptions)
+      self.assertEqual(options.beam_services, {'foo': 'bar'})
+
+  def test_beam_services_from_env_and_flag(self):
+    with mock.patch.dict(
+        os.environ,
+        {'BEAM_SERVICE_OVERRIDES': '{"foo": "bar", "other": "zzz"}'},
+        clear=True):
+      options = PipelineOptions(['--beam_services={"foo": "override"}'
+                                 ]).view_as(CrossLanguageOptions)
+      self.assertEqual(
+          options.beam_services, {
+              'foo': 'override', 'other': 'zzz'
+          })
 
   def test_option_modifications_are_shared_between_views(self):
     pipeline_options = PipelineOptions([
@@ -631,6 +646,11 @@ class PipelineOptionsTest(unittest.TestCase):
     mapping = options.view_as(GoogleCloudOptions).transform_name_mapping
     self.assertEqual(mapping['from'], 'to')
 
+  def test_jar_cache_dir(self):
+    options = PipelineOptions(['--jar_cache_dir=/path/to/jar_cache_dir'])
+    jar_cache_dir = options.view_as(JobServerOptions).jar_cache_dir
+    self.assertEqual(jar_cache_dir, '/path/to/jar_cache_dir')
+
   def test_dataflow_service_options(self):
     options = PipelineOptions([
         '--dataflow_service_option',
@@ -702,6 +722,151 @@ class PipelineOptionsTest(unittest.TestCase):
         " with different dest/option_name from the flag name, please add "
         "the dest and the flag name to the map "
         "_FLAG_THAT_SETS_FALSE_VALUE in PipelineOptions.py")
+
+  def test_gcs_custom_audit_entries(self):
+    options = PipelineOptions([
+        '--gcs_custom_audit_entry=user=test-user',
+        '--gcs_custom_audit_entry=work=test-work',
+        '--gcs_custom_audit_entries={"job":"test-job", "id":"1234"}'
+    ])
+    entries = options.view_as(GoogleCloudOptions).gcs_custom_audit_entries
+    self.assertDictEqual(
+        entries,
+        {
+            'x-goog-custom-audit-user': 'test-user',
+            'x-goog-custom-audit-work': 'test-work',
+            'x-goog-custom-audit-job': 'test-job',
+            'x-goog-custom-audit-id': '1234'
+        })
+
+  @mock.patch('apache_beam.options.pipeline_options._BeamArgumentParser.error')
+  def test_gcs_custom_audit_entries_with_errors(self, mock_error):
+    long_key = 'a' * 65
+    options = PipelineOptions([f'--gcs_custom_audit_entry={long_key}=1'])
+    _ = options.view_as(GoogleCloudOptions).gcs_custom_audit_entries
+    self.assertRegex(
+        mock_error.call_args[0][0],
+        'The key .* exceeds the 64-character limit.')
+
+    mock_error.reset_mock()
+
+    long_value = 'b' * 1201
+    options = PipelineOptions([f'--gcs_custom_audit_entry=key={long_value}'])
+    _ = options.view_as(GoogleCloudOptions).gcs_custom_audit_entries
+    self.assertRegex(
+        mock_error.call_args[0][0],
+        'The value .* exceeds the 1200-character limit.')
+
+    mock_error.reset_mock()
+
+    options = PipelineOptions([
+        '--gcs_custom_audit_entry=a=1',
+        '--gcs_custom_audit_entry=b=2',
+        '--gcs_custom_audit_entry=c=3',
+        '--gcs_custom_audit_entry=d=4',
+        '--gcs_custom_audit_entry=job=test-job'
+    ])
+    _ = options.view_as(GoogleCloudOptions).gcs_custom_audit_entries
+    self.assertRegex(
+        mock_error.call_args[0][0],
+        'The maximum allowed number of GCS custom audit entries .*')
+
+    mock_error.reset_mock()
+
+    options = PipelineOptions([
+        '--gcs_custom_audit_entry=a=1',
+        '--gcs_custom_audit_entry=b=2',
+        '--gcs_custom_audit_entry=c=3',
+        '--gcs_custom_audit_entry=d=4'
+    ])
+    _ = options.view_as(GoogleCloudOptions).gcs_custom_audit_entries
+    self.assertRegex(
+        mock_error.call_args[0][0],
+        'The maximum allowed number of GCS custom audit entries .*')
+
+  def _check_errors(self, options, validator, expected):
+    if has_gcsio:
+      with mock.patch('apache_beam.io.gcp.gcsio.GcsIO.is_soft_delete_enabled',
+                      return_value=False):
+        errors = options._handle_temp_and_staging_locations(validator)
+        self.assertEqual(errors, expected)
+    else:
+      errors = options._handle_temp_and_staging_locations(validator)
+      self.assertEqual(errors, expected)
+
+  def test_validation_good_stg_good_temp(self):
+    runner = MockRunners.DataflowRunner()
+    options = GoogleCloudOptions([
+        '--project=myproject',
+        '--staging_location=gs://beam/stg',
+        '--temp_location=gs://beam/tmp'
+    ])
+    validator = PipelineOptionsValidator(options, runner)
+    self._check_errors(options, validator, [])
+    self.assertEqual(
+        options.get_all_options()['staging_location'], "gs://beam/stg")
+    self.assertEqual(
+        options.get_all_options()['temp_location'], "gs://beam/tmp")
+
+  def test_validation_bad_stg_good_temp(self):
+    runner = MockRunners.DataflowRunner()
+    options = GoogleCloudOptions([
+        '--project=myproject',
+        '--staging_location=badGSpath',
+        '--temp_location=gs://beam/tmp'
+    ])
+    validator = PipelineOptionsValidator(options, runner)
+    self._check_errors(options, validator, [])
+    self.assertEqual(
+        options.get_all_options()['staging_location'], "gs://beam/tmp")
+    self.assertEqual(
+        options.get_all_options()['temp_location'], "gs://beam/tmp")
+
+  def test_validation_good_stg_bad_temp(self):
+    runner = MockRunners.DataflowRunner()
+    options = GoogleCloudOptions([
+        '--project=myproject',
+        '--staging_location=gs://beam/stg',
+        '--temp_location=badGSpath'
+    ])
+    validator = PipelineOptionsValidator(options, runner)
+    self._check_errors(options, validator, [])
+    self.assertEqual(
+        options.get_all_options()['staging_location'], "gs://beam/stg")
+    self.assertEqual(
+        options.get_all_options()['temp_location'], "gs://beam/stg")
+
+  def test_validation_bad_stg_bad_temp_with_default(self):
+    runner = MockRunners.DataflowRunner()
+    options = MockGoogleCloudOptionsWithBucket([
+        '--project=myproject',
+        '--staging_location=badGSpath',
+        '--temp_location=badGSpath'
+    ])
+    validator = PipelineOptionsValidator(options, runner)
+    self._check_errors(options, validator, [])
+    self.assertEqual(
+        options.get_all_options()['staging_location'], "gs://default/bucket")
+    self.assertEqual(
+        options.get_all_options()['temp_location'], "gs://default/bucket")
+
+  def test_validation_bad_stg_bad_temp_no_default(self):
+    runner = MockRunners.DataflowRunner()
+    options = MockGoogleCloudOptionsNoBucket([
+        '--project=myproject',
+        '--staging_location=badGSpath',
+        '--temp_location=badGSpath'
+    ])
+    validator = PipelineOptionsValidator(options, runner)
+    self._check_errors(
+        options,
+        validator,
+        [
+          'Invalid GCS path (badGSpath), given for the option: ' \
+            'temp_location.',
+          'Invalid GCS path (badGSpath), given for the option: ' \
+            'staging_location.'
+        ])
 
 
 if __name__ == '__main__':

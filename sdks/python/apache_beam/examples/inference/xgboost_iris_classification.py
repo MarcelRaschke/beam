@@ -17,10 +17,8 @@
 
 import argparse
 import logging
-from typing import Callable
-from typing import Iterable
-from typing import List
-from typing import Tuple
+from collections.abc import Callable
+from collections.abc import Iterable
 from typing import Union
 
 import numpy
@@ -48,7 +46,7 @@ class PostProcessor(beam.DoFn):
   """Process the PredictionResult to get the predicted label.
   Returns a comma separated string with true label and predicted label.
   """
-  def process(self, element: Tuple[int, PredictionResult]) -> Iterable[str]:
+  def process(self, element: tuple[int, PredictionResult]) -> Iterable[str]:
     label, prediction_result = element
     prediction = prediction_result.inference
     yield '{},{}'.format(label, prediction)
@@ -73,6 +71,13 @@ def parse_known_args(argv):
       dest='model_state',
       required=True,
       help='Path to the state of the XGBoost model loaded for Inference.')
+  parser.add_argument(
+      '--large_model',
+      action='store_true',
+      dest='large_model',
+      default=False,
+      help='Set to true if your model is large enough to run into memory '
+      'pressure if you load multiple copies.')
   group = parser.add_mutually_exclusive_group(required=True)
   group.add_argument('--split', action='store_true', dest='split')
   group.add_argument('--no_split', action='store_false', dest='split')
@@ -82,7 +87,7 @@ def parse_known_args(argv):
 def load_sklearn_iris_test_data(
     data_type: Callable,
     split: bool = True,
-    seed: int = 999) -> List[Union[numpy.array, pandas.DataFrame]]:
+    seed: int = 999) -> list[Union[numpy.array, pandas.DataFrame]]:
   """
     Loads test data from the sklearn Iris dataset in a given format,
     either in a single or multiple batches.
@@ -125,7 +130,8 @@ def run(
   xgboost_model_handler = KeyedModelHandler(
       model_handler(
           model_class=xgboost.XGBClassifier,
-          model_state=known_args.model_state))
+          model_state=known_args.model_state,
+          large_model=known_args.large_model))
 
   input_data = load_sklearn_iris_test_data(
       data_type=input_data_type, split=known_args.split)

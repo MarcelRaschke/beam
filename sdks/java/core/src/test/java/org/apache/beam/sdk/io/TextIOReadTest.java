@@ -51,12 +51,14 @@ import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPOutputStream;
 import java.util.zip.ZipEntry;
@@ -91,7 +93,6 @@ import org.apache.beam.sdk.transforms.windowing.Window;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Charsets;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Joiner;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
@@ -245,15 +246,24 @@ public class TextIOReadTest {
   }
 
   private static TextSource prepareSource(
-      TemporaryFolder temporaryFolder, byte[] data, @Nullable byte[] delimiter) throws IOException {
+      TemporaryFolder temporaryFolder, byte[] data, @Nullable byte[] delimiter, int skipHeaderLines)
+      throws IOException {
     Path path = temporaryFolder.newFile().toPath();
     Files.write(path, data);
-    return getTextSource(path.toString(), delimiter);
+    return getTextSource(path.toString(), delimiter, skipHeaderLines);
+  }
+
+  public static TextSource getTextSource(
+      String path, @Nullable byte[] delimiter, int skipHeaderLines) {
+    return new TextSource(
+        ValueProvider.StaticValueProvider.of(path),
+        EmptyMatchTreatment.DISALLOW,
+        delimiter,
+        skipHeaderLines);
   }
 
   public static TextSource getTextSource(String path, @Nullable byte[] delimiter) {
-    return new TextSource(
-        ValueProvider.StaticValueProvider.of(path), EmptyMatchTreatment.DISALLOW, delimiter);
+    return getTextSource(path, delimiter, 0);
   }
 
   private static String getFileSuffix(Compression compression) {
@@ -377,53 +387,96 @@ public class TextIOReadTest {
       runTestReadWithData(line.getBytes(UTF_8), expected);
     }
 
+    // Placeholder channel that only yields 0- and 1-length buffers.
+    private static class SlowReadChannel implements ReadableByteChannel {
+      int readCount = 0;
+      InputStream stream;
+      ReadableByteChannel channel;
+
+      public SlowReadChannel(FileBasedSource source) throws IOException {
+        channel =
+            FileSystems.open(
+                FileSystems.matchSingleFileSpec(source.getFileOrPatternSpec()).resourceId());
+        stream = Channels.newInputStream(channel);
+      }
+
+      // Data is read at most one byte at a time from line parameter.
+      @Override
+      public int read(ByteBuffer dst) throws IOException {
+        if (++readCount % 3 == 0) {
+          if (dst.hasRemaining()) {
+            int value = stream.read();
+            if (value == -1) {
+              return -1;
+            }
+            dst.put((byte) value);
+            return 1;
+          }
+        }
+        return 0;
+      }
+
+      @Override
+      public boolean isOpen() {
+        return channel.isOpen();
+      }
+
+      @Override
+      public void close() throws IOException {
+        stream.close();
+      }
+    }
+
     @Test
-    public void testReadLinesWithDefaultDelimiterAndZeroAndOneLengthReturningChannel()
-        throws Exception {
+    public void testReadLinesWithDefaultDelimiterAndSlowReadChannel() throws Exception {
       Path path = tempFolder.newFile().toPath();
       Files.write(path, line.getBytes(UTF_8));
       Metadata metadata = FileSystems.matchSingleFileSpec(path.toString());
       FileBasedSource source =
-          getTextSource(path.toString(), null)
+          getTextSource(path.toString(), null, 0)
               .createForSubrangeOfFile(metadata, 0, metadata.sizeBytes());
+
       FileBasedReader<String> reader =
           source.createSingleFileReader(PipelineOptionsFactory.create());
-      ReadableByteChannel channel =
-          FileSystems.open(
-              FileSystems.matchSingleFileSpec(source.getFileOrPatternSpec()).resourceId());
-      InputStream stream = Channels.newInputStream(channel);
-      reader.startReading(
-          // Placeholder channel that only yields 0- and 1-length buffers.
-          // Data is read at most one byte at a time from line parameter.
-          new ReadableByteChannel() {
-            int readCount = 0;
 
-            @Override
-            public int read(ByteBuffer dst) throws IOException {
-              if (++readCount % 3 == 0) {
-                if (dst.hasRemaining()) {
-                  int value = stream.read();
-                  if (value == -1) {
-                    return -1;
-                  }
-                  dst.put((byte) value);
-                  return 1;
-                }
-              }
-              return 0;
-            }
-
-            @Override
-            public boolean isOpen() {
-              return channel.isOpen();
-            }
-
-            @Override
-            public void close() throws IOException {
-              stream.close();
-            }
-          });
+      reader.startReading(new SlowReadChannel(source));
       assertEquals(expected, SourceTestUtils.readFromStartedReader(reader));
+    }
+
+    @Test
+    public void testReadLinesWithDefaultDelimiterOnSplittingSourceAndSlowReadChannel()
+        throws Exception {
+      Path path = tempFolder.newFile().toPath();
+      Files.write(path, line.getBytes(UTF_8));
+      Metadata metadata = FileSystems.matchSingleFileSpec(path.toString());
+      FileBasedSource<String> source =
+          getTextSource(path.toString(), null, 0)
+              .createForSubrangeOfFile(metadata, 0, metadata.sizeBytes());
+
+      PipelineOptions options = PipelineOptionsFactory.create();
+
+      // Check every possible split positions.
+      for (int i = 0; i < line.length(); ++i) {
+        double fraction = i * 1.0 / line.length();
+        FileBasedReader<String> reader = source.createSingleFileReader(options);
+
+        // Use a slow read channel to read the content byte by byte. This can simulate the scenario
+        // of a certain character (in our case CR) occurring at the end of the read buffer.
+        reader.startReading(new SlowReadChannel(source));
+
+        // In order to get a successful split, we need to read at least one record before calling
+        // splitAtFraction().
+        List<String> totalItems = SourceTestUtils.readNItemsFromStartedReader(reader, 1);
+        BoundedSource<String> residual = reader.splitAtFraction(fraction);
+        List<String> primaryItems = SourceTestUtils.readFromStartedReader(reader);
+        totalItems.addAll(primaryItems);
+
+        if (residual != null) {
+          List<String> residualItems = SourceTestUtils.readFromSource(residual, options);
+          totalItems.addAll(residualItems);
+        }
+        assertEquals(expected, totalItems);
+      }
     }
 
     @Test
@@ -433,7 +486,49 @@ public class TextIOReadTest {
     }
 
     private TextSource prepareSource(byte[] data) throws IOException {
-      return TextIOReadTest.prepareSource(tempFolder, data, null);
+      return TextIOReadTest.prepareSource(tempFolder, data, null, 0);
+    }
+
+    private void runTestReadWithData(byte[] data, List<String> expectedResults) throws Exception {
+      TextSource source = prepareSource(data);
+      List<String> actual = SourceTestUtils.readFromSource(source, PipelineOptionsFactory.create());
+      assertThat(
+          actual, containsInAnyOrder(new ArrayList<>(expectedResults).toArray(new String[0])));
+    }
+  }
+
+  /** Tests for reading files with/without header. */
+  @RunWith(Parameterized.class)
+  public static class SkippingHeaderTest {
+    private static final ImmutableList<String> EXPECTED = ImmutableList.of("asdf", "hjkl", "xyz");
+    @Rule public TemporaryFolder tempFolder = new TemporaryFolder();
+
+    @Parameterized.Parameters(name = "{index}: {0}")
+    public static Iterable<Object[]> data() {
+      return ImmutableList.<Object[]>builder()
+          .add(new Object[] {"\n\n\n", ImmutableList.of("", ""), 1})
+          .add(new Object[] {"\n", ImmutableList.of(), 1})
+          .add(new Object[] {"header\nasdf\nhjkl\nxyz\n", EXPECTED, 1})
+          .add(new Object[] {"header1\nheader2\nasdf\nhjkl\nxyz\n", EXPECTED, 2})
+          .build();
+    }
+
+    @Parameterized.Parameter(0)
+    public String line;
+
+    @Parameterized.Parameter(1)
+    public ImmutableList<String> expected;
+
+    @Parameterized.Parameter(2)
+    public int skipHeaderLines;
+
+    @Test
+    public void testReadLines() throws Exception {
+      runTestReadWithData(line.getBytes(UTF_8), expected);
+    }
+
+    private TextSource prepareSource(byte[] data) throws IOException {
+      return TextIOReadTest.prepareSource(tempFolder, data, null, skipHeaderLines);
     }
 
     private void runTestReadWithData(byte[] data, List<String> expectedResults) throws Exception {
@@ -477,7 +572,8 @@ public class TextIOReadTest {
     @Test
     public void testReadLinesWithCustomDelimiter() throws Exception {
       SourceTestUtils.assertSplitAtFractionExhaustive(
-          TextIOReadTest.prepareSource(tempFolder, testCase.getBytes(UTF_8), new byte[] {'|', '*'}),
+          TextIOReadTest.prepareSource(
+              tempFolder, testCase.getBytes(UTF_8), new byte[] {'|', '*'}, 0),
           PipelineOptionsFactory.create());
     }
 
@@ -489,7 +585,7 @@ public class TextIOReadTest {
       Files.write(path, testCase.getBytes(UTF_8));
       Metadata metadata = FileSystems.matchSingleFileSpec(path.toString());
       FileBasedSource source =
-          getTextSource(path.toString(), delimiter)
+          getTextSource(path.toString(), delimiter, 0)
               .createForSubrangeOfFile(metadata, 0, metadata.sizeBytes());
       FileBasedReader<String> reader =
           source.createSingleFileReader(PipelineOptionsFactory.create());
@@ -547,7 +643,7 @@ public class TextIOReadTest {
       try (PrintStream writer = new PrintStream(new FileOutputStream(tmpFile))) {
         for (String elem : expected) {
           byte[] encodedElem = CoderUtils.encodeToByteArray(StringUtf8Coder.of(), elem);
-          String line = new String(encodedElem, Charsets.UTF_8);
+          String line = new String(encodedElem, StandardCharsets.UTF_8);
           writer.println(line);
         }
       }
@@ -579,8 +675,10 @@ public class TextIOReadTest {
             "To be, or not to be: that *is the question: ",
             // complete delimiter
             "Whether 'tis nobler in the mind to suffer |*",
+            // edge case: partial delimiter then complete delimiter
+            "The slings and arrows of outrageous fortune,*||**|",
             // truncated delimiter
-            "The slings and arrows of outrageous fortune,|"
+            "Or to take arms against a sea of troubles,|"
           };
 
       File tmpFile = tempFolder.newFile("tmpfile.txt");
@@ -594,7 +692,75 @@ public class TextIOReadTest {
           .containsInAnyOrder(
               "To be, or not to be: that |is the question: To be, or not to be: "
                   + "that *is the question: Whether 'tis nobler in the mind to suffer ",
-              "The slings and arrows of outrageous fortune,|");
+              "The slings and arrows of outrageous fortune,*|",
+              "*|Or to take arms against a sea of troubles,|");
+      p.run();
+    }
+
+    @Test
+    @Category(NeedsRunner.class)
+    public void testReadStringsWithCustomDelimiter_NestedDelimiter() throws IOException {
+      // Test for https://github.com/apache/beam/issues/32251
+      String delimiter = "AABAAC";
+      String text = "0AABAAC1AABAABAAC2AABAAABAAC";
+      List<String> expected = Arrays.asList("0", "1AAB", "2AABA");
+      assertEquals(
+          expected, Arrays.asList(Pattern.compile(delimiter, Pattern.LITERAL).split(text)));
+
+      File tmpFile = tempFolder.newFile("tmpfile.txt");
+      String filename = tmpFile.getPath();
+
+      try (Writer writer = Files.newBufferedWriter(tmpFile.toPath(), UTF_8)) {
+        writer.write(text);
+      }
+
+      PAssert.that(
+              p.apply(
+                  TextIO.read()
+                      .from(filename)
+                      .withDelimiter(delimiter.getBytes(StandardCharsets.UTF_8))))
+          .containsInAnyOrder(expected);
+      p.run();
+    }
+
+    @Test
+    @Category(NeedsRunner.class)
+    public void testReadStringsWithCustomDelimiter_PartialDelimiterMatchedAtBoundary()
+        throws IOException {
+      // Test for https://github.com/apache/beam/issues/32249
+      StringBuilder sb = new StringBuilder();
+      for (int i = 0; i < 8190; ++i) {
+        sb.append('0');
+      }
+      sb.append('A'); // index 8190
+      sb.append('B'); // index 8191
+      sb.append('C'); // index 8192
+      for (int i = 8193; i < 16400; ++i) {
+        sb.append('0');
+      }
+
+      String text = sb.toString();
+      String delimiter = "ABCDE";
+
+      // check the text is not split by the delimiter
+      assertEquals(
+          Collections.singletonList(text),
+          Arrays.asList(Pattern.compile(delimiter, Pattern.LITERAL).split(text)));
+
+      File tmpFile = tempFolder.newFile("tmpfile.txt");
+      String filename = tmpFile.getPath();
+
+      try (Writer writer = Files.newBufferedWriter(tmpFile.toPath(), UTF_8)) {
+        writer.write(text);
+      }
+
+      // Expects no IndexOutOfBoundsException
+      PAssert.that(
+              p.apply(
+                  TextIO.read()
+                      .from(filename)
+                      .withDelimiter(delimiter.getBytes(StandardCharsets.UTF_8))))
+          .containsInAnyOrder(text);
       p.run();
     }
 
@@ -743,7 +909,7 @@ public class TextIOReadTest {
     }
 
     private TextSource prepareSource(byte[] data) throws IOException {
-      return TextIOReadTest.prepareSource(tempFolder, data, null);
+      return TextIOReadTest.prepareSource(tempFolder, data, null, 0);
     }
 
     @Test
@@ -770,7 +936,7 @@ public class TextIOReadTest {
     public void testProgressTextFile() throws IOException {
       String file = "line1\nline2\nline3";
       try (BoundedSource.BoundedReader<String> reader =
-          prepareSource(file.getBytes(Charsets.UTF_8))
+          prepareSource(file.getBytes(StandardCharsets.UTF_8))
               .createReader(PipelineOptionsFactory.create())) {
         // Check preconditions before starting
         assertEquals(0.0, reader.getFractionConsumed(), 1e-6);
@@ -806,7 +972,7 @@ public class TextIOReadTest {
     @Test
     public void testProgressAfterSplitting() throws IOException {
       String file = "line1\nline2\nline3";
-      BoundedSource<String> source = prepareSource(file.getBytes(Charsets.UTF_8));
+      BoundedSource<String> source = prepareSource(file.getBytes(StandardCharsets.UTF_8));
       BoundedSource<String> remainder;
 
       // Create the remainder, verifying properties pre- and post-splitting.
@@ -977,7 +1143,8 @@ public class TextIOReadTest {
               new TextSource(
                   ValueProvider.StaticValueProvider.of(input),
                   EmptyMatchTreatment.DISALLOW,
-                  new byte[] {'\n'});
+                  new byte[] {'\n'},
+                  0);
 
       PCollection<KV<String, String>> lines =
           p.apply(
@@ -1102,7 +1269,7 @@ public class TextIOReadTest {
             ValueProvider.StaticValueProvider.of(file.getMetadata().resourceId().getFilename());
         // Create a TextSource, passing null as the delimiter to use the default
         // delimiters ('\n', '\r', or '\r\n').
-        TextSource textSource = new TextSource(filenameProvider, null, null);
+        TextSource textSource = new TextSource(filenameProvider, null, null, 0);
         try {
           BoundedSource.BoundedReader<String> reader =
               textSource

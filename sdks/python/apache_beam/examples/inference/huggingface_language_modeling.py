@@ -27,10 +27,8 @@ file in which users can then compare against the original sentence.
 
 import argparse
 import logging
-from typing import Dict
-from typing import Iterable
-from typing import Iterator
-from typing import Tuple
+from collections.abc import Iterable
+from collections.abc import Iterator
 
 import apache_beam as beam
 import torch
@@ -45,14 +43,14 @@ from transformers import AutoModelForMaskedLM
 from transformers import AutoTokenizer
 
 
-def add_mask_to_last_word(text: str) -> Tuple[str, str]:
+def add_mask_to_last_word(text: str) -> tuple[str, str]:
   text_list = text.split()
   return text, ' '.join(text_list[:-2] + ['<mask>', text_list[-1]])
 
 
 def tokenize_sentence(
-    text_and_mask: Tuple[str, str],
-    tokenizer: AutoTokenizer) -> Tuple[str, Dict[str, torch.Tensor]]:
+    text_and_mask: tuple[str, str],
+    tokenizer: AutoTokenizer) -> tuple[str, dict[str, torch.Tensor]]:
   text, masked_text = text_and_mask
   tokenized_sentence = tokenizer.encode_plus(masked_text, return_tensors="pt")
 
@@ -81,7 +79,7 @@ class PostProcessor(beam.DoFn):
     super().__init__()
     self.tokenizer = tokenizer
 
-  def process(self, element: Tuple[str, PredictionResult]) -> Iterable[str]:
+  def process(self, element: tuple[str, PredictionResult]) -> Iterable[str]:
     text, prediction_result = element
     inputs = prediction_result.example
     logits = prediction_result.inference['logits']
@@ -113,7 +111,14 @@ def parse_known_args(argv):
       '--model_class',
       dest='model_class',
       default=AutoModelForMaskedLM,
-      help="Name of the model from Hugging Face")
+      help='Name of the model from Hugging Face')
+  parser.add_argument(
+      '--large_model',
+      action='store_true',
+      dest='large_model',
+      default=False,
+      help='Set to true if your model is large enough to run into memory '
+      'pressure if you load multiple copies.')
   return parser.parse_known_args(argv)
 
 
@@ -139,7 +144,8 @@ def run(
       model_uri=known_args.model_name,
       model_class=known_args.model_class,
       framework='pt',
-      max_batch_size=1)
+      max_batch_size=1,
+      large_model=known_args.large_model)
   if not known_args.input:
     text = (
         pipeline | 'CreateSentences' >> beam.Create([

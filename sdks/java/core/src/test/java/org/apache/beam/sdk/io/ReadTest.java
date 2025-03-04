@@ -38,7 +38,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
-import org.apache.beam.sdk.coders.AvroCoder;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.CoderException;
 import org.apache.beam.sdk.coders.CustomCoder;
@@ -180,12 +179,7 @@ public class ReadTest implements Serializable {
     // read is default.
     ExperimentalOptions.addExperiment(
         pipeline.getOptions().as(ExperimentalOptions.class), "use_sdf_read");
-    // Force the pipeline to run with one thread to ensure the reader will be reused on one DoFn
-    // instance.
-    // We are not able to use DirectOptions because of circular dependency.
-    pipeline
-        .runWithAdditionalOptionArgs(ImmutableList.of("--targetParallelism=1"))
-        .waitUntilFinish();
+    pipeline.run().waitUntilFinish();
   }
 
   @Test
@@ -343,7 +337,7 @@ public class ReadTest implements Serializable {
 
     @Override
     public Coder<CounterMark> getCheckpointMarkCoder() {
-      return AvroCoder.of(CountingSource.CounterMark.class);
+      return new CountingSource.CounterMarkCoder();
     }
   }
 

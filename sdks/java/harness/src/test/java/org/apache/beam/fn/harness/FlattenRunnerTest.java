@@ -30,11 +30,11 @@ import java.util.List;
 import java.util.Map;
 import org.apache.beam.model.pipeline.v1.RunnerApi;
 import org.apache.beam.model.pipeline.v1.RunnerApi.PCollection;
-import org.apache.beam.runners.core.construction.CoderTranslation;
-import org.apache.beam.runners.core.construction.PTransformTranslation;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.fn.data.FnDataReceiver;
 import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.beam.sdk.util.construction.CoderTranslation;
+import org.apache.beam.sdk.util.construction.PTransformTranslation;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -90,8 +90,11 @@ public class FlattenRunnerTest {
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(pTransformId, pTransform)
             .processBundleInstructionId("57")
-            .pCollections(pCollectionMap)
-            .coders(Collections.singletonMap("coder-id", coder))
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(pCollectionMap)
+                    .putAllCoders(Collections.singletonMap("coder-id", coder))
+                    .build())
             .build();
     List<WindowedValue<String>> mainOutputValues = new ArrayList<>();
     context.addPCollectionConsumer(
@@ -150,8 +153,11 @@ public class FlattenRunnerTest {
     PTransformRunnerFactoryTestContext context =
         PTransformRunnerFactoryTestContext.builder(pTransformId, pTransform)
             .processBundleInstructionId("57")
-            .pCollections(Collections.singletonMap("inputATarget", pCollection))
-            .coders(Collections.singletonMap("coder-id", coder))
+            .components(
+                RunnerApi.Components.newBuilder()
+                    .putAllPcollections(Collections.singletonMap("inputATarget", pCollection))
+                    .putAllCoders(Collections.singletonMap("coder-id", coder))
+                    .build())
             .build();
     List<WindowedValue<String>> mainOutputValues = new ArrayList<>();
     context.addPCollectionConsumer(

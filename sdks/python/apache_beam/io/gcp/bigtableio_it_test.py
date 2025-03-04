@@ -49,11 +49,21 @@ except ImportError as e:
   HttpError = None
 
 
+def instance_prefix(instance):
+  datestr = "".join(filter(str.isdigit, str(datetime.utcnow().date())))
+  instance_id = '%s-%s-%s' % (instance, datestr, secrets.token_hex(4))
+  assert len(instance_id) < 34, "instance id length needs to be within [6, 33]"
+  return instance_id
+
+
 @pytest.mark.uses_gcp_java_expansion_service
-@unittest.skipUnless(
-    os.environ.get('EXPANSION_PORT'),
-    "EXPANSION_PORT environment var is not provided.")
+@pytest.mark.uses_transform_service
 @unittest.skipIf(client is None, 'Bigtable dependencies are not installed')
+@unittest.skipUnless(
+    os.environ.get('EXPANSION_JARS') or
+    os.environ.get('TRANSFORM_SERVICE_PORT'),
+    "A valid expansion service is not available for executing the "
+    "cross-language test.")
 class TestReadFromBigTableIT(unittest.TestCase):
   INSTANCE = "bt-read-tests"
   TABLE_ID = "test-table"
@@ -62,10 +72,8 @@ class TestReadFromBigTableIT(unittest.TestCase):
     self.test_pipeline = TestPipeline(is_integration_test=True)
     self.args = self.test_pipeline.get_full_options_as_args()
     self.project = self.test_pipeline.get_option('project')
-    self.expansion_service = ('localhost:%s' % os.environ.get('EXPANSION_PORT'))
 
-    instance_id = '%s-%s-%s' % (
-        self.INSTANCE, str(int(time.time())), secrets.token_hex(3))
+    instance_id = instance_prefix(self.INSTANCE)
 
     self.client = client.Client(admin=True, project=self.project)
     # create cluster and instance
@@ -85,6 +93,11 @@ class TestReadFromBigTableIT(unittest.TestCase):
     self.table = self.instance.table(self.TABLE_ID)
     self.table.create()
     _LOGGER.info("Created table [%s]", self.table.table_id)
+    if (os.environ.get('TRANSFORM_SERVICE_PORT')):
+      self._transform_service_address = (
+          'localhost:' + os.environ.get('TRANSFORM_SERVICE_PORT'))
+    else:
+      self._transform_service_address = None
 
   def tearDown(self):
     try:
@@ -95,7 +108,7 @@ class TestReadFromBigTableIT(unittest.TestCase):
       self.table.delete()
       self.instance.delete()
     except HttpError:
-      _LOGGER.debug(
+      _LOGGER.warning(
           "Failed to clean up table [%s] and instance [%s]",
           self.table.table_id,
           self.instance.instance_id)
@@ -135,17 +148,20 @@ class TestReadFromBigTableIT(unittest.TestCase):
               project_id=self.project,
               instance_id=self.instance.instance_id,
               table_id=self.table.table_id,
-              expansion_service=self.expansion_service)
+              expansion_service=self._transform_service_address)
           | "Extract cells" >> beam.Map(lambda row: row._cells))
 
       assert_that(cells, equal_to(expected_cells))
 
 
 @pytest.mark.uses_gcp_java_expansion_service
-@unittest.skipUnless(
-    os.environ.get('EXPANSION_PORT'),
-    "EXPANSION_PORT environment var is not provided.")
+@pytest.mark.uses_transform_service
 @unittest.skipIf(client is None, 'Bigtable dependencies are not installed')
+@unittest.skipUnless(
+    os.environ.get('EXPANSION_JARS') or
+    os.environ.get('TRANSFORM_SERVICE_PORT'),
+    "A valid expansion service is not available for executing the "
+    "cross-language test.")
 class TestWriteToBigtableXlangIT(unittest.TestCase):
   # These are integration tests for the cross-language write transform.
   INSTANCE = "bt-write-xlang"
@@ -156,10 +172,8 @@ class TestWriteToBigtableXlangIT(unittest.TestCase):
     cls.test_pipeline = TestPipeline(is_integration_test=True)
     cls.project = cls.test_pipeline.get_option('project')
     cls.args = cls.test_pipeline.get_full_options_as_args()
-    cls.expansion_service = ('localhost:%s' % os.environ.get('EXPANSION_PORT'))
 
-    instance_id = '%s-%s-%s' % (
-        cls.INSTANCE, str(int(time.time())), secrets.token_hex(3))
+    instance_id = instance_prefix(cls.INSTANCE)
 
     cls.client = client.Client(admin=True, project=cls.project)
     # create cluster and instance
@@ -182,13 +196,18 @@ class TestWriteToBigtableXlangIT(unittest.TestCase):
         (self.TABLE_ID, str(int(time.time())), secrets.token_hex(3)))
     self.table.create()
     _LOGGER.info("Created table [%s]", self.table.table_id)
+    if (os.environ.get('TRANSFORM_SERVICE_PORT')):
+      self._transform_service_address = (
+          'localhost:' + os.environ.get('TRANSFORM_SERVICE_PORT'))
+    else:
+      self._transform_service_address = None
 
   def tearDown(self):
     try:
       _LOGGER.info("Deleting table [%s]", self.table.table_id)
       self.table.delete()
     except HttpError:
-      _LOGGER.debug("Failed to clean up table [%s]", self.table.table_id)
+      _LOGGER.warning("Failed to clean up table [%s]", self.table.table_id)
 
   @classmethod
   def tearDownClass(cls):
@@ -196,7 +215,7 @@ class TestWriteToBigtableXlangIT(unittest.TestCase):
       _LOGGER.info("Deleting instance [%s]", cls.instance.instance_id)
       cls.instance.delete()
     except HttpError:
-      _LOGGER.debug(
+      _LOGGER.warning(
           "Failed to clean up instance [%s]", cls.instance.instance_id)
 
   def run_pipeline(self, rows):
@@ -209,7 +228,7 @@ class TestWriteToBigtableXlangIT(unittest.TestCase):
               instance_id=self.instance.instance_id,
               table_id=self.table.table_id,
               use_cross_language=True,
-              expansion_service=self.expansion_service))
+              expansion_service=self._transform_service_address))
 
   def test_set_mutation(self):
     row1: DirectRow = DirectRow('key-1')
@@ -221,6 +240,9 @@ class TestWriteToBigtableXlangIT(unittest.TestCase):
     row1_col2_cell = Cell(b'val1-2', 200_000_000)
     row2_col1_cell = Cell(b'val2-1', 100_000_000)
     row2_col2_cell = Cell(b'val2-2', 200_000_000)
+    # When setting this cell, we won't set a timestamp. We expect the timestamp
+    # to default to -1, and Bigtable will set it to system time at insertion.
+    row2_col1_no_timestamp = Cell(b'val2-2-notimestamp', time.time())
     # rows sent to write transform
     row1.set_cell(
         'col_fam', b'col-1', row1_col1_cell.value, row1_col1_cell.timestamp)
@@ -230,6 +252,8 @@ class TestWriteToBigtableXlangIT(unittest.TestCase):
         'col_fam', b'col-1', row2_col1_cell.value, row2_col1_cell.timestamp)
     row2.set_cell(
         'col_fam', b'col-2', row2_col2_cell.value, row2_col2_cell.timestamp)
+    # don't set a timestamp here. it should default to -1
+    row2.set_cell('col_fam', b'col-no-timestamp', row2_col1_no_timestamp.value)
 
     self.run_pipeline([row1, row2])
 
@@ -246,6 +270,19 @@ class TestWriteToBigtableXlangIT(unittest.TestCase):
         row2_col1_cell, actual_row2.find_cells('col_fam', b'col-1')[0])
     self.assertEqual(
         row2_col2_cell, actual_row2.find_cells('col_fam', b'col-2')[0])
+
+    # check mutation that doesn't have a timestamp set is handled properly:
+    self.assertEqual(
+        row2_col1_no_timestamp.value,
+        actual_row2.find_cells('col_fam', b'col-no-timestamp')[0].value)
+    # Bigtable sets timestamp as insertion time, which is later than the
+    # time.time() we set when creating this test case
+    cell_timestamp = actual_row2.find_cells('col_fam',
+                                            b'col-no-timestamp')[0].timestamp
+    self.assertTrue(
+        row2_col1_no_timestamp.timestamp < cell_timestamp,
+        msg="Expected cell with unset timestamp to have ingestion time "
+        f"attached, but was {cell_timestamp}")
 
   def test_delete_cells_mutation(self):
     col_fam = self.table.column_family('col_fam')

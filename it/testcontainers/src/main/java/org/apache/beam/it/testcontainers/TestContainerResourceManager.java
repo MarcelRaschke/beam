@@ -18,9 +18,9 @@
 package org.apache.beam.it.testcontainers;
 
 import java.util.concurrent.Callable;
-import javax.annotation.Nullable;
 import org.apache.beam.it.common.ResourceManager;
 import org.apache.beam.it.common.TestProperties;
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
@@ -68,7 +68,12 @@ public abstract class TestContainerResourceManager<T extends GenericContainer<?>
     }
 
     if (!usingStaticContainer) {
-      container.start();
+      // TODO(pranavbhandari): Change this to use log.getUtf8StringWithoutLineEnding() when
+      // testcontainers dependency is updated.
+      container
+          .withLogConsumer(
+              log -> LOG.info("{}: {}", container.getDockerImageName(), log.getUtf8String()))
+          .start();
     } else if (builder.host == null || builder.port < 0) {
       throw new TestContainerResourceManagerException(
           "This manager was configured to use a static resource, but the host and port were not properly set.");

@@ -15,8 +15,6 @@
 # limitations under the License.
 #
 
-# cython: language_level=3
-
 """Coder implementations.
 
 The actual encode/decode implementations are split off from coders to
@@ -502,7 +500,9 @@ class FastPrimitivesCoderImpl(StreamCoderImpl):
         self.encode_to_stream(value.value, stream, True)
       except Exception as e:
         raise TypeError(self._deterministic_encoding_error_msg(value)) from e
-    elif hasattr(value, "__getstate__"):
+    elif (hasattr(value, "__getstate__") and
+          # https://github.com/apache/beam/issues/33020
+          type(value).__reduce__ == object.__reduce__):
       if not hasattr(value, "__setstate__"):
         raise TypeError(
             "Unable to deterministically encode '%s' of type '%s', "
@@ -1421,6 +1421,37 @@ class PaneInfoCoderImpl(StreamCoderImpl):
     return size
 
 
+class _OrderedUnionCoderImpl(StreamCoderImpl):
+  def __init__(self, coder_impl_types, fallback_coder_impl):
+    assert len(coder_impl_types) < 128
+    self._types, self._coder_impls = zip(*coder_impl_types)
+    self._fallback_coder_impl = fallback_coder_impl
+
+  def encode_to_stream(self, value, out, nested):
+    value_t = type(value)
+    for (ix, t) in enumerate(self._types):
+      if value_t is t:
+        out.write_byte(ix)
+        c = self._coder_impls[ix]  # for typing
+        c.encode_to_stream(value, out, nested)
+        break
+    else:
+      if self._fallback_coder_impl is None:
+        raise ValueError("No fallback.")
+      out.write_byte(0xFF)
+      self._fallback_coder_impl.encode_to_stream(value, out, nested)
+
+  def decode_from_stream(self, in_stream, nested):
+    ix = in_stream.read_byte()
+    if ix == 0xFF:
+      if self._fallback_coder_impl is None:
+        raise ValueError("No fallback.")
+      return self._fallback_coder_impl.decode_from_stream(in_stream, nested)
+    else:
+      c = self._coder_impls[ix]  # for typing
+      return c.decode_from_stream(in_stream, nested)
+
+
 class WindowedValueCoderImpl(StreamCoderImpl):
   """For internal use only; no backwards-compatibility guarantees.
 
@@ -1641,10 +1672,65 @@ class TimestampPrefixingWindowCoderImpl(StreamCoderImpl):
     return self._window_coder_impl.decode_from_stream(stream, nested)
 
   def estimate_size(self, value: Any, nested: bool = False) -> int:
-    estimated_size = 0
-    estimated_size += TimestampCoderImpl().estimate_size(value)
-    estimated_size += self._window_coder_impl.estimate_size(value, nested)
-    return estimated_size
+    return (
+        TimestampCoderImpl().estimate_size(value.max_timestamp()) +
+        self._window_coder_impl.estimate_size(value, nested))
+
+
+_OpaqueWindow = None
+
+
+def _create_opaque_window(end, encoded_window):
+  # This is lazy to avoid circular import issues.
+  global _OpaqueWindow
+  if _OpaqueWindow is None:
+    from apache_beam.transforms.window import BoundedWindow
+
+    class _OpaqueWindow(BoundedWindow):
+      def __init__(self, end, encoded_window):
+        super().__init__(end)
+        self.encoded_window = encoded_window
+
+      def __repr__(self):
+        return 'OpaqueWindow(%s, %s)' % (self.end, self.encoded_window)
+
+      def __hash__(self):
+        return hash(self.encoded_window)
+
+      def __eq__(self, other):
+        return (
+            type(self) == type(other) and self.end == other.end and
+            self.encoded_window == other.encoded_window)
+
+  return _OpaqueWindow(end, encoded_window)
+
+
+class TimestampPrefixingOpaqueWindowCoderImpl(StreamCoderImpl):
+  """For internal use only; no backwards-compatibility guarantees.
+
+  A coder for unknown window types, which prefix required max_timestamp to
+  encoded original window.
+
+  The coder encodes and decodes custom window types with following format:
+    window's max_timestamp()
+    length prefixed encoded window
+  """
+  def __init__(self) -> None:
+    pass
+
+  def encode_to_stream(self, value, stream, nested):
+    TimestampCoderImpl().encode_to_stream(value.max_timestamp(), stream, True)
+    stream.write(value.encoded_window, True)
+
+  def decode_from_stream(self, stream, nested):
+    max_timestamp = TimestampCoderImpl().decode_from_stream(stream, True)
+    return _create_opaque_window(
+        max_timestamp.successor(), stream.read_all(True))
+
+  def estimate_size(self, value: Any, nested: bool = False) -> int:
+    return (
+        TimestampCoderImpl().estimate_size(value.max_timestamp()) +
+        len(value.encoded_window))
 
 
 row_coders_registered = False
@@ -1922,7 +2008,7 @@ class DecimalCoderImpl(StreamCoderImpl):
 
   def encode_to_stream(self, value, out, nested):
     # type: (decimal.Decimal, create_OutputStream, bool) -> None
-    scale = -value.as_tuple().exponent
+    scale = -value.as_tuple().exponent  # type: ignore[operator]
     int_value = int(value.scaleb(scale))
     out.write_var_int64(scale)
     self.BIG_INT_CODER_IMPL.encode_to_stream(int_value, out, nested)

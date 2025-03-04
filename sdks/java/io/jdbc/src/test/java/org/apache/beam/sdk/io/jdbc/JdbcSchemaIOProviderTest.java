@@ -17,9 +17,15 @@
  */
 package org.apache.beam.sdk.io.jdbc;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Objects;
 import javax.sql.DataSource;
 import org.apache.beam.sdk.io.common.DatabaseTestHelper;
 import org.apache.beam.sdk.io.common.TestRow;
@@ -80,9 +86,94 @@ public class JdbcSchemaIOProviderTest {
     pipeline.run();
   }
 
+  @Test
+  public void testPartitionedReadWithExplicitSchema() {
+    JdbcSchemaIOProvider provider = new JdbcSchemaIOProvider();
+
+    Schema customSchema =
+        Schema.of(
+            Schema.Field.of("CUSTOMER_NAME", Schema.FieldType.STRING).withNullable(true),
+            Schema.Field.of("CUSTOMER_ID", Schema.FieldType.INT32).withNullable(true));
+
+    Row config =
+        Row.withSchema(provider.configurationSchema())
+            .withFieldValue("driverClassName", DATA_SOURCE_CONFIGURATION.getDriverClassName().get())
+            .withFieldValue("jdbcUrl", DATA_SOURCE_CONFIGURATION.getUrl().get())
+            .withFieldValue("username", "")
+            .withFieldValue("password", "")
+            .withFieldValue("partitionColumn", "id")
+            .withFieldValue("partitions", (short) 10)
+            .build();
+
+    JdbcSchemaIOProvider.JdbcSchemaIO schemaIO =
+        provider.from(
+            String.format("(select name,id from %s) as subq", READ_TABLE_NAME),
+            config,
+            customSchema);
+
+    PCollection<Row> output = pipeline.apply(schemaIO.buildReader());
+
+    assertEquals(customSchema, output.getSchema());
+
+    Long expected = Long.valueOf(EXPECTED_ROW_COUNT);
+    PAssert.that(output.apply(Count.globally())).containsInAnyOrder(expected);
+
+    PAssert.that(output)
+        .satisfies(
+            rows -> {
+              for (Row row : rows) {
+                assertNotNull(row.getString("CUSTOMER_NAME"));
+                assertNotNull(row.getInt32("CUSTOMER_ID"));
+              }
+              return null;
+            });
+
+    pipeline.run();
+  }
+
+  @Test
+  public void testReadWithExplicitSchema() {
+    JdbcSchemaIOProvider provider = new JdbcSchemaIOProvider();
+
+    Schema customSchema =
+        Schema.of(
+            Schema.Field.of("CUSTOMER_NAME", Schema.FieldType.STRING).withNullable(true),
+            Schema.Field.of("CUSTOMER_ID", Schema.FieldType.INT32).withNullable(true));
+
+    Row config =
+        Row.withSchema(provider.configurationSchema())
+            .withFieldValue("driverClassName", DATA_SOURCE_CONFIGURATION.getDriverClassName().get())
+            .withFieldValue("jdbcUrl", DATA_SOURCE_CONFIGURATION.getUrl().get())
+            .withFieldValue("username", "")
+            .withFieldValue("password", "")
+            .withFieldValue("readQuery", "SELECT name, id FROM " + READ_TABLE_NAME)
+            .build();
+
+    JdbcSchemaIOProvider.JdbcSchemaIO schemaIO =
+        provider.from(READ_TABLE_NAME, config, customSchema);
+
+    PCollection<Row> output = pipeline.apply(schemaIO.buildReader());
+
+    assertEquals(customSchema, output.getSchema());
+
+    Long expected = Long.valueOf(EXPECTED_ROW_COUNT);
+    PAssert.that(output.apply(Count.globally())).containsInAnyOrder(expected);
+
+    PAssert.that(output)
+        .satisfies(
+            rows -> {
+              for (Row row : rows) {
+                assertNotNull(row.getString("CUSTOMER_NAME"));
+                assertNotNull(row.getInt32("CUSTOMER_ID"));
+              }
+              return null;
+            });
+
+    pipeline.run();
+  }
+
   // This test shouldn't work because we only support numeric and datetime columns and we are trying
-  // to use a string
-  // column as our partition source
+  // to use a string column as our partition source.
   @Test
   public void testPartitionedReadThatShouldntWork() throws Exception {
     JdbcSchemaIOProvider provider = new JdbcSchemaIOProvider();
@@ -108,6 +199,44 @@ public class JdbcSchemaIOProviderTest {
       return;
     }
     throw new Exception("Did not throw an exception");
+  }
+
+  // This test verifies we can read back existing data source configuration. It also serves as
+  // sanity check that the
+  // getDataSourceConfiguration should keep in sync with JdbcSchemaIOProvider.configurationSchema.
+  // Otherwise the test
+  // would throw an exception.
+  @Test
+  public void testAbleToReadDataSourceConfiguration() {
+    JdbcSchemaIOProvider provider = new JdbcSchemaIOProvider();
+
+    Row config =
+        Row.withSchema(provider.configurationSchema())
+            .withFieldValue("driverClassName", "className")
+            .withFieldValue("jdbcUrl", "url")
+            .withFieldValue("username", "user")
+            .withFieldValue("password", "passwd")
+            .withFieldValue("connectionProperties", "connectionProp")
+            .withFieldValue("connectionInitSqls", new ArrayList<>(Collections.singleton("initSql")))
+            .withFieldValue("maxConnections", (short) 3)
+            .withFieldValue("driverJars", "test.jar")
+            .withFieldValue("writeBatchSize", 10L)
+            .build();
+    JdbcSchemaIOProvider.JdbcSchemaIO schemaIO =
+        provider.from(READ_TABLE_NAME, config, Schema.builder().build());
+    JdbcIO.DataSourceConfiguration dataSourceConf = schemaIO.getDataSourceConfiguration();
+    assertEquals("className", Objects.requireNonNull(dataSourceConf.getDriverClassName()).get());
+    assertEquals("url", Objects.requireNonNull(dataSourceConf.getUrl()).get());
+    assertEquals("user", Objects.requireNonNull(dataSourceConf.getUsername()).get());
+    assertEquals("passwd", Objects.requireNonNull(dataSourceConf.getPassword()).get());
+    assertEquals(
+        "connectionProp", Objects.requireNonNull(dataSourceConf.getConnectionProperties()).get());
+    assertEquals(
+        new ArrayList<>(Collections.singleton("initSql")),
+        Objects.requireNonNull(dataSourceConf.getConnectionInitSqls()).get());
+    assertEquals(3, (int) dataSourceConf.getMaxConnections().get());
+    assertEquals("test.jar", Objects.requireNonNull(dataSourceConf.getDriverJars()).get());
+    assertEquals(10L, schemaIO.config.getInt64("writeBatchSize").longValue());
   }
 
   /** Create test data that is consistent with that generated by TestRow. */
