@@ -44,6 +44,8 @@ import org.apache.flink.core.io.SimpleVersionedSerializer;
  */
 public abstract class FlinkSource<T, OutputT>
     implements Source<OutputT, FlinkSourceSplit<T>, Map<Integer, List<FlinkSourceSplit<T>>>> {
+
+  protected final String stepName;
   protected final org.apache.beam.sdk.io.Source<T> beamSource;
   protected final Boundedness boundedness;
   protected final SerializablePipelineOptions serializablePipelineOptions;
@@ -53,39 +55,25 @@ public abstract class FlinkSource<T, OutputT>
   // ----------------- public static methods to construct sources --------------------
 
   public static <T> FlinkBoundedSource<T> bounded(
+      String stepName,
       BoundedSource<T> boundedSource,
       SerializablePipelineOptions serializablePipelineOptions,
       int numSplits) {
     return new FlinkBoundedSource<>(
-        boundedSource, serializablePipelineOptions, Boundedness.BOUNDED, numSplits);
+        stepName, boundedSource, serializablePipelineOptions, Boundedness.BOUNDED, numSplits);
   }
 
   public static <T> FlinkUnboundedSource<T> unbounded(
+      String stepName,
       UnboundedSource<T, ?> source,
       SerializablePipelineOptions serializablePipelineOptions,
       int numSplits) {
-    return new FlinkUnboundedSource<>(source, serializablePipelineOptions, numSplits);
-  }
-
-  public static FlinkBoundedSource<byte[]> unboundedImpulse(long shutdownSourceAfterIdleMs) {
-    FlinkPipelineOptions flinkPipelineOptions = FlinkPipelineOptions.defaults();
-    flinkPipelineOptions.setShutdownSourcesAfterIdleMs(shutdownSourceAfterIdleMs);
-    // Here we wrap the BeamImpulseSource with a FlinkBoundedSource, but overriding its
-    // boundedness to CONTINUOUS_UNBOUNDED. By doing so, the Flink engine will treat this
-    // source as an unbounded source and execute the job in streaming mode. This also
-    // works well with checkpoint, because the FlinkSourceSplit containing the
-    // BeamImpulseSource will be discarded after the impulse emission. So the streaming
-    // job won't see another impulse after failover.
-    return new FlinkBoundedSource<>(
-        new BeamImpulseSource(),
-        new SerializablePipelineOptions(flinkPipelineOptions),
-        Boundedness.CONTINUOUS_UNBOUNDED,
-        1,
-        record -> Watermark.MAX_WATERMARK.getTimestamp());
+    return new FlinkUnboundedSource<>(stepName, source, serializablePipelineOptions, numSplits);
   }
 
   public static FlinkBoundedSource<byte[]> boundedImpulse() {
     return new FlinkBoundedSource<>(
+        "Impulse",
         new BeamImpulseSource(),
         new SerializablePipelineOptions(FlinkPipelineOptions.defaults()),
         Boundedness.BOUNDED,
@@ -96,10 +84,12 @@ public abstract class FlinkSource<T, OutputT>
   // ------ Common implementations for both bounded and unbounded source ---------
 
   protected FlinkSource(
+      String stepName,
       org.apache.beam.sdk.io.Source<T> beamSource,
       SerializablePipelineOptions serializablePipelineOptions,
       Boundedness boundedness,
       int numSplits) {
+    this.stepName = stepName;
     this.beamSource = beamSource;
     this.serializablePipelineOptions = serializablePipelineOptions;
     this.boundedness = boundedness;
@@ -114,8 +104,21 @@ public abstract class FlinkSource<T, OutputT>
   @Override
   public SplitEnumerator<FlinkSourceSplit<T>, Map<Integer, List<FlinkSourceSplit<T>>>>
       createEnumerator(SplitEnumeratorContext<FlinkSourceSplit<T>> enumContext) throws Exception {
-    return new FlinkSourceSplitEnumerator<>(
-        enumContext, beamSource, serializablePipelineOptions.get(), numSplits);
+    return createEnumerator(enumContext, false);
+  }
+
+  public SplitEnumerator<FlinkSourceSplit<T>, Map<Integer, List<FlinkSourceSplit<T>>>>
+      createEnumerator(
+          SplitEnumeratorContext<FlinkSourceSplit<T>> enumContext, boolean splitInitialized)
+          throws Exception {
+
+    if (boundedness == Boundedness.BOUNDED) {
+      return new LazyFlinkSourceSplitEnumerator<>(
+          enumContext, beamSource, serializablePipelineOptions.get(), numSplits, splitInitialized);
+    } else {
+      return new FlinkSourceSplitEnumerator<>(
+          enumContext, beamSource, serializablePipelineOptions.get(), numSplits, splitInitialized);
+    }
   }
 
   @Override
@@ -124,9 +127,8 @@ public abstract class FlinkSource<T, OutputT>
           SplitEnumeratorContext<FlinkSourceSplit<T>> enumContext,
           Map<Integer, List<FlinkSourceSplit<T>>> checkpoint)
           throws Exception {
-    FlinkSourceSplitEnumerator<T> enumerator =
-        new FlinkSourceSplitEnumerator<>(
-            enumContext, beamSource, serializablePipelineOptions.get(), numSplits);
+    SplitEnumerator<FlinkSourceSplit<T>, Map<Integer, List<FlinkSourceSplit<T>>>> enumerator =
+        createEnumerator(enumContext, true);
     checkpoint.forEach(
         (subtaskId, splitsForSubtask) -> enumerator.addSplitsBack(splitsForSubtask, subtaskId));
     return enumerator;

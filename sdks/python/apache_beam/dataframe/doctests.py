@@ -45,8 +45,6 @@ import sys
 import traceback
 from io import StringIO
 from typing import Any
-from typing import Dict
-from typing import List
 
 import numpy as np
 import pandas as pd
@@ -146,7 +144,7 @@ class _InMemoryResultRecorder(object):
   """
 
   # Class-level value to survive pickling.
-  _ALL_RESULTS = {}  # type: Dict[str, List[Any]]
+  _ALL_RESULTS: dict[str, list[Any]] = {}
 
   def __init__(self):
     self._id = id(self)
@@ -225,6 +223,8 @@ class _DeferrredDataframeOutputChecker(doctest.OutputChecker):
 
   def fix(self, want, got):
     if 'DeferredBase' in got:
+      # When we have a tuple of Dataframes, pandas prints each from a new line.
+      got = re.sub(r'DeferredBase\[(\d+)\],', '\\g<0>\n', got)
       try:
         to_compute = {
             m.group(0): self._env._all_frames[int(m.group(1))]
@@ -381,20 +381,23 @@ class BeamDataframeDoctestRunner(doctest.DocTestRunner):
     self._skipped_set = set()
 
   def _is_wont_implement_ok(self, example, test):
+    always_wont_implement = self._wont_implement_ok.get('*', [])
     return any(
-        wont_implement(example)
-        for wont_implement in self._wont_implement_ok.get(test.name, []))
+        wont_implement(example) for wont_implement in (
+            self._wont_implement_ok.get(test.name, []) + always_wont_implement))
 
   def _is_not_implemented_ok(self, example, test):
+    always_not_impl = self._not_implemented_ok.get('*', [])
     return any(
-        not_implemented(example)
-        for not_implemented in self._not_implemented_ok.get(test.name, []))
+        not_implemented(example) for not_implemented in (
+            self._not_implemented_ok.get(test.name, []) + always_not_impl))
 
   def run(self, test, **kwargs):
     self._checker.reset()
+    always_skip = self._skip.get('*', [])
     for example in test.examples:
       if any(should_skip(example)
-             for should_skip in self._skip.get(test.name, [])):
+             for should_skip in self._skip.get(test.name, []) + always_skip):
         self._skipped_set.add(example)
         example.source = 'pass'
         example.want = ''
@@ -660,7 +663,10 @@ def set_pandas_options():
   # See
   # https://github.com/pandas-dev/pandas/blob/a00202d12d399662b8045a8dd3fdac04f18e1e55/doc/source/conf.py#L319
   np.random.seed(123456)
-  np.set_printoptions(precision=4, suppress=True)
+  legacy = None
+  if np.version.version.startswith('2'):
+    legacy = '1.25'
+  np.set_printoptions(precision=4, suppress=True, legacy=legacy)
   pd.options.display.max_rows = 15
 
 
@@ -721,14 +727,15 @@ def with_run_patched_docstring(target=None):
 
     Args:
       optionflags (int): Passed through to doctests.
-      extraglobs (Dict[str,Any]): Passed through to doctests.
+      extraglobs (dict[str,Any]): Passed through to doctests.
       use_beam (bool): If true, run a Beam pipeline with partitioned input to
         verify the examples, else use PartitioningSession to simulate
         distributed execution.
-      skip (Dict[str,str]): A set of examples to skip entirely.
-      wont_implement_ok (Dict[str,str]): A set of examples that are allowed to
+      skip (dict[str,str]): A set of examples to skip entirely.
+        If a key is '*', an example will be skipped in all test scenarios.
+      wont_implement_ok (dict[str,str]): A set of examples that are allowed to
         raise WontImplementError.
-      not_implemented_ok (Dict[str,str]): A set of examples that are allowed to
+      not_implemented_ok (dict[str,str]): A set of examples that are allowed to
         raise NotImplementedError.
 
     Returns:

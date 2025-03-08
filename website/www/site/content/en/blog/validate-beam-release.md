@@ -107,15 +107,46 @@ With that, the Beam version in your environment will be the latest release
 candidate, and you can go ahead and run your tests to verify that everything
 works well.
 
+### Validating Prism Runner RC against RC SDKs
+
+Replace v2.59.0-RC1 with the tag of the RC version being validated.
+
+#### Python
+
+To validate the prism runner with Python,
+`--runner=PrismRunner --prism_location=https://github.com/apache/beam/releases/tag/v2.59.0-RC1 --prism_beam_version_override=v2.59.0`
+
+* The `runner` flag sets Beam to use Prism.
+* The `prism_location` sets the source of Prism assets.
+* The `prism_beam_version_override` flag sets what those artifacts are labeled as.
+* The assets are packaged as the final release version, so the override is required.
+
+#### Java
+
+For Gradle, add the Prism, and the JAMM depdendencies to your `build.gradle`.
+
+```
+    implementation "org.apache.beam:beam-runners-prism-java:2.59.0"
+    implementation "com.github.jbellis:jamm:0.4.0"
+```
+
+Then add the following flags, substituting the version accordingly.
+
+`--runner=PrismRunner --prismLocation="https://github.com/apache/beam/releases/tag/v2.59.0-RC1/" --prismVersionOverride=v2.59.0
+
+* The `runner` flag sets Beam to use Prism.
+* The `prismLocation` sets the source of Prism assets, specifically the zip file of the version in question.
+
+
 ### Configuring a Go build to validate a Beam release candidate
 
 For Go SDK releases, you can fetch the Go SDK RC using [`go get`](https://golang.org/ref/mod#go-get),
 by requesting the specific pre-release version.
 
-For example, to request the first release candidate for 2.34.0:
+For example, to request the first release candidate for 2.44.0:
 
 ```
-go get -d github.com/apache/beam/sdks/v2@v2.34.0-RC1
+go get -d github.com/apache/beam/sdks/v2@v2.44.0-RC1
 ```
 
 With that, the Beam version in your `go.mod` will be the specified release candidate.
@@ -123,4 +154,4 @@ You can go ahead and run your tests to verify that everything works well.
 
 You may need to also specify the RC's matching container when running a job.
 Use the `--environment_config` flag to specify the release candidate container:
-eg. `--environment_config=apache/beam_go_sdk:2.34.0_rc1`
+eg. `--environment_config=apache/beam_go_sdk:2.44.0rc1`

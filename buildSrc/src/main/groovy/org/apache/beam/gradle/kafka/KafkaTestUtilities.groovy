@@ -28,11 +28,13 @@ class KafkaTestUtilities {
 
     @Inject
     KafkaBatchIT(String delimited, String undelimited, Boolean sdfCompatible, ConfigurationContainer configurations, Project runningProject){
+      def kafkaioProject = runningProject.findProject(":sdks:java:io:kafka")
       group = "Verification"
       description = "Runs KafkaIO IT tests with Kafka clients API $delimited"
       outputs.upToDateWhen { false }
       testClassesDirs = runningProject.findProject(":sdks:java:io:kafka").sourceSets.test.output.classesDirs
-      classpath =  configurations."kafkaVersion$undelimited" + runningProject.sourceSets.test.runtimeClasspath + runningProject.findProject(":sdks:java:io:kafka").sourceSets.test.runtimeClasspath
+      classpath = runningProject.sourceSets.test.runtimeClasspath + kafkaioProject.configurations."kafkaVersion$undelimited" + kafkaioProject.sourceSets.test.runtimeClasspath
+      systemProperty "beam.target.kafka.version", delimited
 
       def pipelineOptions = [
         '--sourceOptions={' +
@@ -40,7 +42,7 @@ class KafkaTestUtilities {
         '"keySizeBytes": "10",' +
         '"valueSizeBytes": "90"' +
         '}',
-        "--readTimeout=120",
+        "--readTimeout=60",
         "--kafkaTopic=beam",
         "--withTestcontainers=true",
         "--kafkaContainerVersion=5.5.2",
@@ -56,6 +58,7 @@ class KafkaTestUtilities {
           excludeTestsMatching "*SDFResumesCorrectly" //Kafka SDF does not work for kafka versions <2.0.1
           excludeTestsMatching "*StopReadingFunction" //Kafka SDF does not work for kafka versions <2.0.1
           excludeTestsMatching "*WatermarkUpdateWithSparseMessages" //Kafka SDF does not work for kafka versions <2.0.1
+          excludeTestsMatching "*KafkaIOSDFReadWithErrorHandler"
         }
       }
     }

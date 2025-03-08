@@ -65,6 +65,7 @@ public class JdbcSchemaIOProvider implements SchemaIOProvider {
         .addNullableField("readQuery", FieldType.STRING)
         .addNullableField("writeStatement", FieldType.STRING)
         .addNullableField("fetchSize", FieldType.INT16)
+        .addNullableField("disableAutoCommit", FieldType.BOOLEAN)
         .addNullableField("outputParallelization", FieldType.BOOLEAN)
         .addNullableField("autosharding", FieldType.BOOLEAN)
         // Partitioning support. If you specify a partition column we will use that instead of
@@ -73,6 +74,7 @@ public class JdbcSchemaIOProvider implements SchemaIOProvider {
         .addNullableField("partitions", FieldType.INT16)
         .addNullableField("maxConnections", FieldType.INT16)
         .addNullableField("driverJars", FieldType.STRING)
+        .addNullableField("writeBatchSize", FieldType.INT64)
         .build();
   }
 
@@ -82,7 +84,7 @@ public class JdbcSchemaIOProvider implements SchemaIOProvider {
    */
   @Override
   public JdbcSchemaIO from(String location, Row configuration, @Nullable Schema dataSchema) {
-    return new JdbcSchemaIO(location, configuration);
+    return new JdbcSchemaIO(location, configuration, dataSchema);
   }
 
   @Override
@@ -99,10 +101,12 @@ public class JdbcSchemaIOProvider implements SchemaIOProvider {
   static class JdbcSchemaIO implements SchemaIO, Serializable {
     protected final Row config;
     protected final String location;
+    protected final @Nullable Schema dataSchema;
 
-    JdbcSchemaIO(String location, Row config) {
+    JdbcSchemaIO(String location, Row config, @Nullable Schema dataSchema) {
       this.config = config;
       this.location = location;
+      this.dataSchema = dataSchema;
     }
 
     @Override
@@ -134,6 +138,21 @@ public class JdbcSchemaIOProvider implements SchemaIOProvider {
             if (partitions != null) {
               readRows = readRows.withNumPartitions(partitions);
             }
+
+            @Nullable Short fetchSize = config.getInt16("fetchSize");
+            if (fetchSize != null) {
+              readRows = readRows.withFetchSize(fetchSize);
+            }
+
+            @Nullable Boolean disableAutoCommit = config.getBoolean("disableAutoCommit");
+            if (disableAutoCommit != null) {
+              readRows = readRows.withDisableAutoCommit(disableAutoCommit);
+            }
+
+            if (dataSchema != null) {
+              readRows = readRows.withSchema(dataSchema);
+            }
+
             return input.apply(readRows);
           } else {
 
@@ -157,6 +176,14 @@ public class JdbcSchemaIOProvider implements SchemaIOProvider {
               readRows = readRows.withOutputParallelization(outputParallelization);
             }
 
+            @Nullable Boolean disableAutoCommit = config.getBoolean("disableAutoCommit");
+            if (disableAutoCommit != null) {
+              readRows = readRows.withDisableAutoCommit(disableAutoCommit);
+            }
+
+            if (dataSchema != null) {
+              readRows = readRows.withSchema(dataSchema);
+            }
             return input.apply(readRows);
           }
         }
@@ -176,6 +203,10 @@ public class JdbcSchemaIOProvider implements SchemaIOProvider {
           @Nullable Boolean autosharding = config.getBoolean("autosharding");
           if (autosharding != null && autosharding) {
             writeRows = writeRows.withAutoSharding();
+          }
+          @Nullable Long writeBatchSize = config.getInt64("writeBatchSize");
+          if (writeBatchSize != null) {
+            writeRows = writeRows.withBatchSize(writeBatchSize);
           }
           return input.apply(writeRows);
         }
@@ -204,9 +235,10 @@ public class JdbcSchemaIOProvider implements SchemaIOProvider {
         dataSourceConfiguration = dataSourceConfiguration.withConnectionInitSqls(initSqls);
       }
 
-      @Nullable Integer maxConnections = config.getInt32("maxConnections");
+      @Nullable Short maxConnections = config.getInt16("maxConnections");
       if (maxConnections != null) {
-        dataSourceConfiguration = dataSourceConfiguration.withMaxConnections(maxConnections);
+        dataSourceConfiguration =
+            dataSourceConfiguration.withMaxConnections(maxConnections.intValue());
       }
 
       @Nullable String driverJars = config.getString("driverJars");

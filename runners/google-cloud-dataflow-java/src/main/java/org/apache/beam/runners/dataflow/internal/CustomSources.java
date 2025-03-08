@@ -18,6 +18,7 @@
 package org.apache.beam.runners.dataflow.internal;
 
 import static com.google.api.client.util.Base64.encodeBase64String;
+import static org.apache.beam.runners.dataflow.util.Structs.addBoolean;
 import static org.apache.beam.runners.dataflow.util.Structs.addString;
 import static org.apache.beam.runners.dataflow.util.Structs.addStringList;
 import static org.apache.beam.sdk.util.SerializableUtils.serializeToByteArray;
@@ -46,9 +47,17 @@ public class CustomSources {
   private static final String SERIALIZED_SOURCE = "serialized_source";
   @VisibleForTesting static final String SERIALIZED_SOURCE_SPLITS = "serialized_source_splits";
 
+  @VisibleForTesting
+  static final String SERIALIZED_OFFSET_BASED_DEDUPLICATION =
+      "serialized_offset_based_deduplication";
+
   private static final Logger LOG = LoggerFactory.getLogger(CustomSources.class);
 
   private static int getDesiredNumUnboundedSourceSplits(DataflowPipelineOptions options) {
+    if (options.getDesiredNumUnboundedSourceSplits() > 0) {
+      return options.getDesiredNumUnboundedSourceSplits();
+    }
+
     int cores = 4; // TODO: decide at runtime?
     if (options.getMaxNumWorkers() > 0) {
       return options.getMaxNumWorkers() * cores;
@@ -89,6 +98,10 @@ public class CustomSources {
       }
       checkArgument(!encodedSplits.isEmpty(), "UnboundedSources must have at least one split");
       addStringList(cloudSource.getSpec(), SERIALIZED_SOURCE_SPLITS, encodedSplits);
+      addBoolean(
+          cloudSource.getSpec(),
+          SERIALIZED_OFFSET_BASED_DEDUPLICATION,
+          unboundedSource.offsetBasedDeduplicationSupported());
     } else {
       throw new IllegalArgumentException("Unexpected source kind: " + source.getClass());
     }

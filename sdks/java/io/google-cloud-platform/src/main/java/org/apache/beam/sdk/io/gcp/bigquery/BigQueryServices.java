@@ -30,6 +30,7 @@ import com.google.api.services.bigquery.model.JobStatistics;
 import com.google.api.services.bigquery.model.Table;
 import com.google.api.services.bigquery.model.TableReference;
 import com.google.api.services.bigquery.model.TableRow;
+import com.google.cloud.bigquery.storage.v1.AppendRowsRequest;
 import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
 import com.google.cloud.bigquery.storage.v1.BatchCommitWriteStreamsResponse;
 import com.google.cloud.bigquery.storage.v1.CreateReadSessionRequest;
@@ -61,6 +62,9 @@ public interface BigQueryServices extends Serializable {
 
   /** Returns a real, mock, or fake {@link DatasetService}. */
   DatasetService getDatasetService(BigQueryOptions bqOptions);
+
+  /** Returns a real, mock, or fake {@link WriteStreamService}. */
+  WriteStreamService getWriteStreamService(BigQueryOptions bqOptions);
 
   /** Returns a real, mock, or fake {@link StorageClient}. */
   StorageClient getStorageClient(BigQueryOptions bqOptions) throws IOException;
@@ -111,7 +115,7 @@ public interface BigQueryServices extends Serializable {
   }
 
   /** An interface to get, create and delete Cloud BigQuery datasets and tables. */
-  public interface DatasetService extends AutoCloseable {
+  interface DatasetService extends AutoCloseable {
 
     // maps the values at
     // https://cloud.google.com/bigquery/docs/reference/rest/v2/tables/get#TableMetadataView
@@ -200,20 +204,26 @@ public interface BigQueryServices extends Serializable {
     /** Patch BigQuery {@link Table} description. */
     Table patchTableDescription(TableReference tableReference, @Nullable String tableDescription)
         throws IOException, InterruptedException;
+  }
 
+  /** An interface to get, create and flush Cloud BigQuery STORAGE API write streams. */
+  interface WriteStreamService extends AutoCloseable {
     /** Create a Write Stream for use with the Storage Write API. */
     WriteStream createWriteStream(String tableUrn, WriteStream.Type type)
         throws IOException, InterruptedException;
 
     @Nullable
-    WriteStream getWriteStream(String writeStream);
+    TableSchema getWriteStreamSchema(String writeStream);
 
     /**
      * Create an append client for a given Storage API write stream. The stream must be created
      * first.
      */
     StreamAppendClient getStreamAppendClient(
-        String streamName, DescriptorProtos.DescriptorProto descriptor, boolean useConnectionPool)
+        String streamName,
+        DescriptorProtos.DescriptorProto descriptor,
+        boolean useConnectionPool,
+        AppendRowsRequest.MissingValueInterpretation missingValueInterpretation)
         throws Exception;
 
     /** Flush a given stream up to the given offset. The stream must have type BUFFERED. */
@@ -290,6 +300,14 @@ public interface BigQueryServices extends Serializable {
 
     /* This method variant collects request count metric, using the fullTableID metadata. */
     SplitReadStreamResponse splitReadStream(SplitReadStreamRequest request, String fullTableId);
+
+    /**
+     * Call this method on Work Item thread to report outstanding metrics.
+     *
+     * <p>Because incrementing metrics is only supported on the execution thread, callback thread
+     * that has pending metrics cannot report it directly.
+     */
+    default void reportPendingMetrics() {}
 
     /**
      * Close the client object.

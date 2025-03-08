@@ -26,13 +26,11 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import org.apache.beam.runners.core.construction.SplittableParDo;
-import org.apache.beam.runners.core.construction.TransformInputs;
-import org.apache.beam.runners.core.construction.graph.ProjectionPushdownOptimizer;
 import org.apache.beam.runners.core.metrics.MetricsPusher;
 import org.apache.beam.runners.spark.metrics.MetricsAccumulator;
 import org.apache.beam.runners.spark.metrics.SparkBeamMetricSource;
 import org.apache.beam.runners.spark.translation.EvaluationContext;
+import org.apache.beam.runners.spark.translation.GroupByKeyVisitor;
 import org.apache.beam.runners.spark.translation.SparkContextFactory;
 import org.apache.beam.runners.spark.translation.SparkPipelineTranslator;
 import org.apache.beam.runners.spark.translation.TransformEvaluator;
@@ -53,6 +51,9 @@ import org.apache.beam.sdk.runners.TransformHierarchy;
 import org.apache.beam.sdk.runners.TransformHierarchy.Node;
 import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.PTransform;
+import org.apache.beam.sdk.util.construction.SplittableParDo;
+import org.apache.beam.sdk.util.construction.TransformInputs;
+import org.apache.beam.sdk.util.construction.graph.ProjectionPushdownOptimizer;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollection.IsBounded;
 import org.apache.beam.sdk.values.PCollectionView;
@@ -213,6 +214,10 @@ public final class SparkRunner extends PipelineRunner<SparkPipelineResult> {
 
       // update the cache candidates
       updateCacheCandidates(pipeline, translator, evaluationContext);
+      updateDependentTransforms(pipeline, translator, evaluationContext);
+
+      // update GBK candidates for memory optimized transform
+      pipeline.traverseTopologically(new GroupByKeyVisitor(translator, evaluationContext));
 
       initAccumulators(pipelineOptions, jsc);
       startPipeline =
@@ -271,8 +276,13 @@ public final class SparkRunner extends PipelineRunner<SparkPipelineResult> {
   /** Evaluator that update/populate the cache candidates. */
   public static void updateCacheCandidates(
       Pipeline pipeline, SparkPipelineTranslator translator, EvaluationContext evaluationContext) {
-    CacheVisitor cacheVisitor = new CacheVisitor(translator, evaluationContext);
-    pipeline.traverseTopologically(cacheVisitor);
+    pipeline.traverseTopologically(new CacheVisitor(translator, evaluationContext));
+  }
+
+  /** Evaluator that update/populate information about dependent transforms for pCollections. */
+  public static void updateDependentTransforms(
+      Pipeline pipeline, SparkPipelineTranslator translator, EvaluationContext evaluationContext) {
+    pipeline.traverseTopologically(new DependentTransformsVisitor(translator, evaluationContext));
   }
 
   /** The translation mode of the Beam Pipeline. */

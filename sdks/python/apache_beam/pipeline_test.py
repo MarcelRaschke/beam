@@ -22,6 +22,7 @@
 import copy
 import platform
 import unittest
+import uuid
 
 import mock
 import pytest
@@ -55,6 +56,8 @@ from apache_beam.transforms.display import DisplayDataItem
 from apache_beam.transforms.environments import ProcessEnvironment
 from apache_beam.transforms.resources import ResourceHint
 from apache_beam.transforms.userstate import BagStateSpec
+from apache_beam.transforms.window import FixedWindows
+from apache_beam.transforms.window import IntervalWindow
 from apache_beam.transforms.window import SlidingWindows
 from apache_beam.transforms.window import TimestampedValue
 from apache_beam.utils import windowed_value
@@ -263,8 +266,49 @@ class PipelineTest(unittest.TestCase):
     self.assertEqual(
         cm.exception.args[0],
         'A transform with label "CustomTransform" already exists in the '
-        'pipeline. To apply a transform with a specified label write '
-        'pvalue | "label" >> transform')
+        'pipeline. To apply a transform with a specified label, write '
+        'pvalue | "label" >> transform or use the option '
+        '"auto_unique_labels" to automatically generate unique '
+        'transform labels. Note "auto_unique_labels" '
+        'could cause data loss when updating a pipeline or '
+        'reloading the job state. This is not recommended for '
+        'streaming jobs.')
+
+  @mock.patch('logging.info')  # Mock the logging.info function
+  def test_no_wait_until_finish(self, mock_info):
+    with Pipeline(runner='DirectRunner',
+                  options=PipelineOptions(["--no_wait_until_finish"])) as p:
+      _ = p | beam.Create(['test'])
+    mock_info.assert_called_once_with(
+        'Job execution continues without waiting for completion. '
+        'Use "wait_until_finish" in PipelineResult to block until finished.')
+    p.result.wait_until_finish()
+
+  def test_auto_unique_labels(self):
+
+    opts = PipelineOptions(["--auto_unique_labels"])
+    with mock.patch.object(uuid, 'uuid4') as mock_uuid_gen:
+      mock_uuids = [mock.Mock(hex='UUID01XXX'), mock.Mock(hex='UUID02XXX')]
+      mock_uuid_gen.side_effect = mock_uuids
+      with TestPipeline(options=opts) as pipeline:
+        pcoll = pipeline | 'pcoll' >> Create([1, 2, 3])
+
+        def identity(x):
+          return x
+
+        pcoll2 = pcoll | Map(identity)
+        pcoll3 = pcoll2 | Map(identity)
+        pcoll4 = pcoll3 | Map(identity)
+        assert_that(pcoll4, equal_to([1, 2, 3]))
+
+    map_id_full_labels = {
+        label
+        for label in pipeline.applied_labels if "Map(identity)" in label
+    }
+    map_id_leaf_labels = {label.split(":")[-1] for label in map_id_full_labels}
+    # Only the first 6 chars of the UUID hex should be used
+    assert map_id_leaf_labels == set(
+        ["Map(identity)", "Map(identity)_UUID01", "Map(identity)_UUID02"])
 
   def test_reuse_cloned_custom_transform_instance(self):
     with TestPipeline() as pipeline:
@@ -729,6 +773,18 @@ class DoFnTest(unittest.TestCase):
                     ((7, (0, 10)), (0, 10)), ((7, (5, 15)), (5, 15))]),
           label='doubled windows')
 
+  def test_windowed_value_param(self):
+    with TestPipeline() as pipeline:
+      pcoll = (
+          pipeline
+          | Create([1, 7])
+          | Map(lambda x: TimestampedValue(x, x))
+          | WindowInto(windowfn=FixedWindows(5))
+          | Map(lambda _, wv=DoFn.WindowedValueParam: (wv.value, wv.windows)))
+      assert_that(
+          pcoll,
+          equal_to([(1, [IntervalWindow(0, 5)]), (7, [IntervalWindow(5, 10)])]))  # pylint: disable=too-many-function-args
+
   def test_timestamp_param(self):
     class TestDoFn(DoFn):
       def process(self, element, timestamp=DoFn.TimestampParam):
@@ -763,6 +819,20 @@ class DoFnTest(unittest.TestCase):
           ]),
           label='CheckGrouped')
 
+  def test_context_params(self):
+    def test_map(
+        x,
+        context_a=DoFn.BundleContextParam(_TestContext, args=('a')),
+        context_b=DoFn.BundleContextParam(_TestContext, args=('b')),
+        context_c=DoFn.SetupContextParam(_TestContext, args=('c'))):
+      return (x, context_a, context_b, context_c)
+
+    self.assertEqual(_TestContext.live_contexts, 0)
+    with TestPipeline() as p:
+      pcoll = p | Create([1, 2]) | beam.Map(test_map)
+      assert_that(pcoll, equal_to([(1, 'a', 'b', 'c'), (2, 'a', 'b', 'c')]))
+    self.assertEqual(_TestContext.live_contexts, 0)
+
   def test_incomparable_default(self):
     class IncomparableType(object):
       def __eq__(self, other):
@@ -782,6 +852,21 @@ class DoFnTest(unittest.TestCase):
           | beam.Create([None])
           | Map(lambda e, x=IncomparableType(): (e, type(x).__name__)))
       assert_that(pcoll, equal_to([(None, 'IncomparableType')]))
+
+
+class _TestContext:
+
+  live_contexts = 0
+
+  def __init__(self, value):
+    self._value = value
+
+  def __enter__(self):
+    _TestContext.live_contexts += 1
+    return self._value
+
+  def __exit__(self, *args):
+    _TestContext.live_contexts -= 1
 
 
 class Bacon(PipelineOptions):
@@ -845,7 +930,9 @@ class PipelineOptionsTest(unittest.TestCase):
         'slices',
         'style',
         'view_as',
-        'display_data'
+        'display_data',
+        'from_runner_api',
+        'to_runner_api',
     },
                      {
                          attr
@@ -857,7 +944,9 @@ class PipelineOptionsTest(unittest.TestCase):
         'get_all_options',
         'style',
         'view_as',
-        'display_data'
+        'display_data',
+        'from_runner_api',
+        'to_runner_api',
     },
                      {
                          attr
@@ -927,6 +1016,51 @@ class RunnerApiTest(unittest.TestCase):
             transform.annotations['proto'], some_proto.SerializeToString())
     self.assertEqual(seen, 2)
 
+  def assertHasAnnotation(self, pipeline_proto, transform, key, value):
+    for transform_proto in pipeline_proto.components.transforms.values():
+      if transform_proto.unique_name == transform:
+        self.assertIn(key, transform_proto.annotations.keys())
+        self.assertEqual(transform_proto.annotations[key], value)
+        break
+    else:
+      self.fail(
+          "Unknown transform: %r not in %s" % (
+              transform,
+              sorted([
+                  t.unique_name
+                  for t in pipeline_proto.components.transforms.values()
+              ])))
+
+  def test_pipeline_context_annotations(self):
+    p = beam.Pipeline()
+    with p.transform_annotations(foo='first'):
+      pcoll = p | beam.Create([1, 2, 3]) | 'First' >> beam.Map(lambda x: x + 1)
+    with p.transform_annotations(foo='second'):
+      _ = pcoll | 'Second' >> beam.Map(lambda x: x * 2)
+      with p.transform_annotations(foo='nested', another='more'):
+        _ = pcoll | 'Nested' >> beam.Map(lambda x: x * 3)
+
+    proto = p.to_runner_api()
+    self.assertHasAnnotation(proto, 'First', 'foo', b'first')
+    self.assertHasAnnotation(proto, 'Second', 'foo', b'second')
+    self.assertHasAnnotation(proto, 'Nested', 'foo', b'nested')
+    self.assertHasAnnotation(proto, 'Nested', 'another', b'more')
+
+  def test_beam_context_annotations(self):
+    p = beam.Pipeline()
+    with beam.transform_annotations(foo='first'):
+      pcoll = p | beam.Create([1, 2, 3]) | 'First' >> beam.Map(lambda x: x + 1)
+    with beam.transform_annotations(foo='second'):
+      _ = pcoll | 'Second' >> beam.Map(lambda x: x * 2)
+      with beam.transform_annotations(foo='nested', another='more'):
+        _ = pcoll | 'Nested' >> beam.Map(lambda x: x * 3)
+
+    proto = p.to_runner_api()
+    self.assertHasAnnotation(proto, 'First', 'foo', b'first')
+    self.assertHasAnnotation(proto, 'Second', 'foo', b'second')
+    self.assertHasAnnotation(proto, 'Nested', 'foo', b'nested')
+    self.assertHasAnnotation(proto, 'Nested', 'another', b'more')
+
   def test_transform_ids(self):
     class MyPTransform(beam.PTransform):
       def expand(self, p):
@@ -964,7 +1098,7 @@ class RunnerApiTest(unittest.TestCase):
         self.p = p
         return p | beam.Create([None])
 
-      def display_data(self):  # type: () -> dict
+      def display_data(self) -> dict:
         parent_dd = super().display_data()
         parent_dd['p_dd_string'] = DisplayDataItem(
             'p_dd_string_value', label='p_dd_string_label')
@@ -978,7 +1112,7 @@ class RunnerApiTest(unittest.TestCase):
         self.p = p
         return p | beam.Create([None])
 
-      def display_data(self):  # type: () -> dict
+      def display_data(self) -> dict:
         parent_dd = super().display_data()
         parent_dd['dd_string'] = DisplayDataItem(
             'dd_string_value', label='dd_string_label')
@@ -1094,7 +1228,7 @@ class RunnerApiTest(unittest.TestCase):
 
       @classmethod
       def get_merged_value(
-          cls, outer_value, inner_value):  # type: (bytes, bytes) -> bytes
+          cls, outer_value: bytes, inner_value: bytes) -> bytes:
         return ResourceHint._use_max(outer_value, inner_value)
 
     ResourceHint.register_resource_hint('foo_hint', FooHint)
@@ -1223,7 +1357,7 @@ class RunnerApiTest(unittest.TestCase):
 
       @classmethod
       def get_merged_value(
-          cls, outer_value, inner_value):  # type: (bytes, bytes) -> bytes
+          cls, outer_value: bytes, inner_value: bytes) -> bytes:
         return ResourceHint._use_max(outer_value, inner_value)
 
     ResourceHint.register_resource_hint('foo_hint', FooHint)

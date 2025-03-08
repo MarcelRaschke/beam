@@ -82,6 +82,8 @@ __all__ = [
     'Dict',
     'Set',
     'FrozenSet',
+    'Collection',
+    'Sequence',
     'Iterable',
     'Iterator',
     'Generator',
@@ -390,12 +392,6 @@ def validate_composite_type_param(type_param, error_msg_prefix):
   if sys.version_info.major == 3 and sys.version_info.minor >= 10:
     if isinstance(type_param, types.UnionType):
       is_not_type_constraint = False
-  # Pre-Python 3.9 compositve type-hinting with built-in types was not
-  # supported, the typing module equivalents should be used instead.
-  if sys.version_info.major == 3 and sys.version_info.minor < 9:
-    is_not_type_constraint = is_not_type_constraint or (
-        isinstance(type_param, type) and
-        type_param in DISALLOWED_PRIMITIVE_TYPES)
 
   if is_not_type_constraint:
     raise TypeError(
@@ -604,6 +600,15 @@ class UnionHint(CompositeTypeHint):
       return Any
     elif len(params) == 1:
       return next(iter(params))
+
+    if len(params) > 1:
+      from apache_beam.typehints import schemas
+      try:
+        return schemas.union_schema_type(params)
+      except (TypeError, KeyError):
+        # Not a union of compatible schema types.
+        pass
+
     return self.UnionConstraint(params)
 
 
@@ -1008,6 +1013,104 @@ class FrozenSetHint(CompositeTypeHint):
 FrozenSetTypeConstraint = FrozenSetHint.FrozenSetTypeConstraint
 
 
+class CollectionHint(CompositeTypeHint):
+  """ A Collection type-hint.
+
+  Collection[X] defines a type-hint for a collection of homogenous types. 'X'
+  may be either a built-in Python type or another nested TypeConstraint.
+
+  This represents a collections.abc.Collection type, which implements
+  __contains__, __iter__, and __len__. This acts as a parent type for
+  sets but has fewer guarantees for mixins.
+  """
+  class CollectionTypeConstraint(SequenceTypeConstraint):
+    def __init__(self, type_param):
+      super().__init__(type_param, abc.Collection)
+
+    def __repr__(self):
+      return 'Collection[%s]' % repr(self.inner_type)
+
+    @staticmethod
+    def _is_subclass_constraint(sub):
+      return isinstance(
+          sub,
+          (
+              CollectionTypeConstraint,
+              ABCSequenceTypeConstraint,
+              FrozenSetTypeConstraint,
+              SetTypeConstraint,
+              ListConstraint))
+
+    def _consistent_with_check_(self, sub):
+      if self._is_subclass_constraint(sub):
+        return is_consistent_with(sub.inner_type, self.inner_type)
+      elif isinstance(sub, TupleConstraint):
+        if not sub.tuple_types:
+          # The empty tuple is consistent with Iterator[T] for any T.
+          return True
+        # Each element in the hetrogenious tuple must be consistent with
+        # the collection  type.
+        # E.g. Tuple[A, B] < Collection[C] if A < C and B < C.
+        return all(
+            is_consistent_with(elem, self.inner_type)
+            for elem in sub.tuple_types)
+      # TODO(https://github.com/apache/beam/issues/29135): allow for
+      # consistency checks with Mapping types
+      elif isinstance(sub, DictConstraint):
+        return True
+      elif not isinstance(sub, TypeConstraint):
+        if getattr(sub, '__origin__', None) is not None and getattr(
+            sub, '__args__', None) is not None:
+          return issubclass(sub, abc.Collection) and is_consistent_with(
+              sub.__args__, self.inner_type)
+      return False
+
+  def __getitem__(self, type_param):
+    validate_composite_type_param(
+        type_param, error_msg_prefix='Parameter to a Collection hint')
+    return self.CollectionTypeConstraint(type_param)
+
+
+CollectionTypeConstraint = CollectionHint.CollectionTypeConstraint
+
+
+class SequenceHint(CompositeTypeHint):
+  """A Sequence type-hint.
+
+  Sequence[X] defines a type-hint for a sequence of homogeneous types. 'X' may
+  be either a built-in Python type or another nested TypeConstraint.
+
+  This represents collections.abc.Sequence type, which implements __getitem__,
+  __len__, and __contains__. This is more specific than Iterable but less
+  restrictive than List, providing a good middle ground for sequence-like types.
+  """
+  class ABCSequenceTypeConstraint(SequenceTypeConstraint):
+    def __init__(self, type_param):
+      super().__init__(type_param, abc.Sequence)
+
+    def __repr__(self):
+      return 'Sequence[%s]' % repr(self.inner_type)
+
+    def _consistent_with_check_(self, sub):
+      if isinstance(sub, (ListConstraint, TupleConstraint)):
+        # Lists and Tuples are Sequences
+        if isinstance(sub, TupleConstraint):
+          # For tuples, all elements must be consistent with the sequence type
+          return all(
+              is_consistent_with(elem, self.inner_type)
+              for elem in sub.tuple_types)
+        return is_consistent_with(sub.inner_type, self.inner_type)
+      return super()._consistent_with_check_(sub)
+
+  def __getitem__(self, type_param):
+    validate_composite_type_param(
+        type_param, error_msg_prefix='Parameter to a Sequence hint')
+    return self.ABCSequenceTypeConstraint(type_param)
+
+
+ABCSequenceTypeConstraint = SequenceHint.ABCSequenceTypeConstraint
+
+
 class IterableHint(CompositeTypeHint):
   """An Iterable type-hint.
 
@@ -1149,6 +1252,15 @@ class WindowedTypeConstraint(TypeConstraint, metaclass=GetitemConstructor):
               repr(self.inner_type),
               instance.value.__class__.__name__))
 
+  def bind_type_variables(self, bindings):
+    bound_inner_type = bind_type_variables(self.inner_type, bindings)
+    if bound_inner_type == self.inner_type:
+      return self
+    return WindowedValue[bound_inner_type]
+
+  def __repr__(self):
+    return 'WindowedValue[%s]' % repr(self.inner_type)
+
 
 class GeneratorHint(IteratorHint):
   """A Generator type hint.
@@ -1178,6 +1290,8 @@ KV = KVHint()
 Dict = DictHint()
 Set = SetHint()
 FrozenSet = FrozenSetHint()
+Collection = CollectionHint()
+Sequence = SequenceHint()
 Iterable = IterableHint()
 Iterator = IteratorHint()
 Generator = GeneratorHint()
@@ -1186,7 +1300,7 @@ WindowedValue = WindowedTypeConstraint
 # There is a circular dependency between defining this mapping
 # and using it in normalize().  Initialize it here and populate
 # it below.
-_KNOWN_PRIMITIVE_TYPES = {}  # type: typing.Dict[type, typing.Any]
+_KNOWN_PRIMITIVE_TYPES: typing.Dict[type, typing.Any] = {}
 
 
 def normalize(x, none_as_type=False):
@@ -1195,14 +1309,14 @@ def normalize(x, none_as_type=False):
   # Avoid circular imports
   from apache_beam.typehints import native_type_compatibility
 
-  if sys.version_info >= (3, 9) and isinstance(x, types.GenericAlias):
-    x = native_type_compatibility.convert_builtin_to_typing(x)
-
   if none_as_type and x is None:
     return type(None)
+  # Convert bare builtin types to correct type hints directly
   elif x in _KNOWN_PRIMITIVE_TYPES:
     return _KNOWN_PRIMITIVE_TYPES[x]
-  elif getattr(x, '__module__', None) == 'typing':
+  elif getattr(x, '__module__',
+               None) in ('typing', 'collections.abc') or getattr(
+                   x, '__origin__', None) in _KNOWN_PRIMITIVE_TYPES:
     beam_type = native_type_compatibility.convert_to_beam_type(x)
     if beam_type != x:
       # We were able to do the conversion.
@@ -1231,10 +1345,18 @@ def is_consistent_with(sub, base):
   relation, but also handles the special Any type as well as type
   parameterization.
   """
+  from apache_beam.pvalue import Row
+  from apache_beam.typehints.row_type import RowTypeConstraint
   if sub == base:
     # Common special case.
     return True
   if isinstance(sub, AnyTypeConstraint) or isinstance(base, AnyTypeConstraint):
+    return True
+  # Per PEP484, ints are considered floats and complexes and
+  # floats are considered complexes.
+  if sub is int and base in (float, complex):
+    return True
+  if sub is float and base is complex:
     return True
   sub = normalize(sub, none_as_type=True)
   base = normalize(base, none_as_type=True)
@@ -1242,9 +1364,15 @@ def is_consistent_with(sub, base):
     return all(is_consistent_with(c, base) for c in sub.union_types)
   elif isinstance(base, TypeConstraint):
     return base._consistent_with_check_(sub)
+  elif isinstance(sub, RowTypeConstraint):
+    return base == Row
   elif isinstance(sub, TypeConstraint):
     # Nothing but object lives above any type constraints.
     return base == object
+  elif is_typing_generic(base):
+    # Cannot check unsupported parameterized generic which will cause issubclass
+    # to fail with an exception.
+    return False
   return issubclass(sub, base)
 
 
@@ -1273,6 +1401,11 @@ def get_yielded_type(type_hint):
     else:  # TupleSequenceConstraint
       return type_hint.inner_type
   if is_consistent_with(type_hint, Iterable[Any]):
+    if isinstance(type_hint, UnionConstraint):
+      yielded_types = set()
+      for typ in type_hint.inner_types():
+        yielded_types.add(get_yielded_type(typ))
+      return Union[yielded_types]
     return type_hint.inner_type
   raise ValueError('%s is not iterable' % type_hint)
 

@@ -109,11 +109,11 @@ class BigQueryReadIntegrationTests(unittest.TestCase):
     request = bigquery.BigqueryDatasetsDeleteRequest(
         projectId=cls.project, datasetId=cls.dataset_id, deleteContents=True)
     try:
-      _LOGGER.info(
+      _LOGGER.debug(
           "Deleting dataset %s in project %s", cls.dataset_id, cls.project)
       cls.bigquery_client.client.datasets.Delete(request)
     except HttpError:
-      _LOGGER.debug(
+      _LOGGER.warning(
           'Failed to clean up dataset %s in project %s',
           cls.dataset_id,
           cls.project)
@@ -307,6 +307,7 @@ class ReadTests(BigQueryReadIntegrationTests):
 
 
 class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
+  BIG_QUERY_DATASET_ID = 'python_read_table_'
   TABLE_DATA = [{
       'number': 1,
       'string': '你好',
@@ -330,7 +331,8 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
   @classmethod
   def setUpClass(cls):
     super(ReadUsingStorageApiTests, cls).setUpClass()
-    cls.table_name = 'python_read_table'
+    cls.table_name = '%s%d%s' % (
+        cls.BIG_QUERY_DATASET_ID, int(time.time()), secrets.token_hex(3))
     cls._create_table(cls.table_name)
 
     table_id = '{}.{}'.format(cls.dataset_id, cls.table_name)
@@ -522,6 +524,19 @@ class ReadUsingStorageApiTests(BigQueryReadIntegrationTests):
               row_restriction='number > 2',
               selected_fields=['string']))
       assert_that(result, equal_to(EXPECTED_TABLE_DATA))
+
+  @pytest.mark.it_postcommit
+  def test_iobase_source_with_column_selection_and_row_restriction_rows(self):
+    with beam.Pipeline(argv=self.args) as p:
+      result = (
+          p | 'Read with BigQuery Storage API' >> beam.io.ReadFromBigQuery(
+              method=beam.io.ReadFromBigQuery.Method.DIRECT_READ,
+              table=self.temp_table_reference,
+              row_restriction='number > 2',
+              selected_fields=['string'],
+              output_type='BEAM_ROW'))
+      assert_that(
+          result | beam.Map(lambda row: row.string), equal_to(['привет']))
 
   @pytest.mark.it_postcommit
   def test_iobase_source_with_very_selective_filters(self):

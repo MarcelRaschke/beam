@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-$schema: 'http://json-schema.org/schema#'
+$schema: 'http://json-schema.org/draft-07/schema#'
 $id: https://github.com/apache/beam/tree/master/sdks/python/apache_beam/yaml/pipeline.schema.yaml
 
 $defs:
@@ -27,6 +27,8 @@ $defs:
       name: { type: string }
       windowing:
         $ref: '#/$defs/windowing'
+      resource_hints:
+        $ref: '#/$defs/resource_hints'
       input:
         oneOf:
           - type: string
@@ -56,7 +58,12 @@ $defs:
           input: {}
           output: {}
           windowing: {}
+          resource_hints: {}
           transforms:
+            type: array
+            items:
+              $ref: '#/$defs/transform'
+          extra_transforms:
             type: array
             items:
               $ref: '#/$defs/transform'
@@ -100,7 +107,10 @@ $defs:
       - if:
           properties: { type: { const: composite }}
         then:
-          $ref: '#/$defs/nestedTransform'
+          allOf:
+            - $ref: '#/$defs/nestedTransform'
+            - properties:
+                extra_transforms: { not: {} }
       - if:
           properties: { type: { const: chain }}
         then:
@@ -108,7 +118,28 @@ $defs:
             - $ref: '#/$defs/nestedTransform'
             - $ref: '#/$defs/implicitInputOutputs'
 
+      - if:
+          not:
+            anyOf:
+              - properties: { type: { const: composite }}
+              - properties: { type: { const: chain }}
+        then:
+          properties:
+            type: {}
+            name: {}
+            input: {}
+            output: {}
+            windowing: {}
+            resource_hints: {}
+            config: { type: object }
+            __line__: {}
+            __uuid__: {}
+          additionalProperties: false
+
   windowing: {}  # TODO
+
+  resource_hints:
+    type: object
 
   provider:
     # TODO(robertwb): Consider enumerating the provider types along with
@@ -121,31 +152,72 @@ $defs:
         properties: { __line__: {}}
         additionalProperties:
           type: string
+      config: { type: object }
+      __line__: {}
+      __uuid__: {}
+    additionalProperties: false
     required:
       - type
       - transforms
+      - config
+
+  providerInclude:
+    # TODO(robertwb): Consider enumerating the provider types along with
+    # the arguments they accept/expect (possibly in a separate schema file).
+    type: object
+    properties:
+      include: { type: string }
+      __line__: {}
+      __uuid__: {}
+    additionalProperties: false
+    required:
+      - include
+
+  providerOrProviderInclude:
+    if:
+      allOf: [
+        { properties: { include: { type: string }}},
+        { required: [ "include" ] }
+      ]
+    then:
+      $ref: '#/$defs/providerInclude'
+    else:
+      $ref: '#/$defs/provider'
 
 type: object
 properties:
   pipeline:
-    anyOf:
-      - type: array
-        items:
-          $ref: '#/$defs/transform'
-      - $ref: '#/$defs/transform'
+    allOf:
+      # These are the only top-level properties defined in pipeline.
       - type: object
         properties:
-          transforms:
-            type: array
-            items:
-              $ref: '#/$defs/transform'
+          type:
+            oneOf:
+              - { const: composite }
+              - { const: chain }
+          windowing:
+            $ref: '#/$defs/windowing'
+          resource_hints:
+            $ref: '#/$defs/resource_hints'
+          transforms: {}
+          extra_transforms: {}
+          sink: {}
+          source: {}
           __line__: {}
           __uuid__: {}
         additionalProperties: false
+      # This defines the allowable contents of the attributes above.
+      - $ref: '#/$defs/nestedTransform'
+      # A chain-type transform, like a chain composite, must have implicit io.
+      - if:
+          properties: { type: { const: chain }}
+          required: [type]
+        then:
+          $ref: '#/$defs/implicitInputOutputs'
   providers:
     type: array
     items:
-      $ref: '#/$defs/provider'
+      $ref: '#/$defs/providerOrProviderInclude'
   options:
     type: object
 required:

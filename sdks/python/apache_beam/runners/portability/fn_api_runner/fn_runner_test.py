@@ -776,7 +776,8 @@ class FnApiRunnerTest(unittest.TestCase):
           state.clear()
           yield buffer
         else:
-          timer.set(ts + 1)
+          # Set the timer to fire within it's window.
+          timer.set(ts + (1 - timestamp.Duration(micros=1000)))
 
       @userstate.on_timer(timer_spec)
       def process_timer(self, state=beam.DoFn.StateParam(state_spec)):
@@ -790,8 +791,10 @@ class FnApiRunnerTest(unittest.TestCase):
       # Acutal should be a grouping of the inputs into batches of size
       # at most buffer_size, but the actual batching is nondeterministic
       # based on ordering and trigger firing timing.
-      self.assertEqual(sorted(sum((list(b) for b in actual), [])), elements)
-      self.assertEqual(max(len(list(buffer)) for buffer in actual), buffer_size)
+      self.assertEqual(
+          sorted(sum((list(b) for b in actual), [])), elements, actual)
+      self.assertEqual(
+          max(len(list(buffer)) for buffer in actual), buffer_size, actual)
       if windowed:
         # Elements were assigned to windows based on their parity.
         # Assert that each grouping consists of elements belonging to the
@@ -1078,6 +1081,27 @@ class FnApiRunnerTest(unittest.TestCase):
           | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
       assert_that(res, equal_to([('a', 1.5), ('b', 3.0)]))
 
+  def test_windowed_combine_per_key(self):
+    with self.create_pipeline() as p:
+      input = (
+          p | beam.Create([12, 2, 1])
+          | beam.Map(lambda t: window.TimestampedValue(('k', t), t)))
+
+      fixed = input | 'Fixed' >> (
+          beam.WindowInto(beam.transforms.window.FixedWindows(10))
+          | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+      assert_that(fixed, equal_to([('k', 1.5), ('k', 12)]))
+
+      sliding = input | 'Sliding' >> (
+          beam.WindowInto(beam.transforms.window.SlidingWindows(20, 10))
+          | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+      assert_that(sliding, equal_to([('k', 1.5), ('k', 5.0), ('k', 12)]))
+
+      sessions = input | 'Sessions' >> (
+          beam.WindowInto(beam.transforms.window.Sessions(5))
+          | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+      assert_that(sessions, equal_to([('k', 1.5), ('k', 12)]))
+
   def test_read(self):
     # Can't use NamedTemporaryFile as a context
     # due to https://bugs.python.org/issue14243
@@ -1116,6 +1140,19 @@ class FnApiRunnerTest(unittest.TestCase):
     gc.collect()
     from apache_beam.runners.portability.fn_api_runner.execution import GenericMergingWindowFn
     self.assertEqual(GenericMergingWindowFn._HANDLES, {})
+
+  def test_custom_window_type(self):
+    with self.create_pipeline() as p:
+      res = (
+          p
+          | beam.Create([1, 2, 100, 101, 102])
+          | beam.Map(lambda t: window.TimestampedValue(('k', t), t))
+          | beam.WindowInto(EvenOddWindows())
+          | beam.GroupByKey()
+          | beam.Map(lambda k_vs1: (k_vs1[0], sorted(k_vs1[1]))))
+      assert_that(
+          res,
+          equal_to([('k', [1]), ('k', [2]), ('k', [101]), ('k', [100, 102])]))
 
   @unittest.skip('BEAM-9119: test is flaky')
   def test_large_elements(self):
@@ -1193,19 +1230,24 @@ class FnApiRunnerTest(unittest.TestCase):
       pcoll_b = p | 'b' >> beam.Create(['b'])
       assert_that((pcoll_a, pcoll_b) | First(), equal_to(['a']))
 
-  def test_metrics(self, check_gauge=True):
+  def test_metrics(self, check_gauge=True, check_bounded_trie=False):
     p = self.create_pipeline()
 
     counter = beam.metrics.Metrics.counter('ns', 'counter')
     distribution = beam.metrics.Metrics.distribution('ns', 'distribution')
     gauge = beam.metrics.Metrics.gauge('ns', 'gauge')
+    string_set = beam.metrics.Metrics.string_set('ns', 'string_set')
+    bounded_trie = beam.metrics.Metrics.bounded_trie('ns', 'bounded_trie')
 
-    pcoll = p | beam.Create(['a', 'zzz'])
+    elements = ['a', 'zzz']
+    pcoll = p | beam.Create(elements)
     # pylint: disable=expression-not-assigned
     pcoll | 'count1' >> beam.FlatMap(lambda x: counter.inc())
     pcoll | 'count2' >> beam.FlatMap(lambda x: counter.inc(len(x)))
     pcoll | 'dist' >> beam.FlatMap(lambda x: distribution.update(len(x)))
     pcoll | 'gauge' >> beam.FlatMap(lambda x: gauge.set(3))
+    pcoll | 'string_set' >> beam.FlatMap(lambda x: string_set.add(x))
+    pcoll | 'bounded_trie' >> beam.FlatMap(lambda x: bounded_trie.add(tuple(x)))
 
     res = p.run()
     res.wait_until_finish()
@@ -1224,6 +1266,18 @@ class FnApiRunnerTest(unittest.TestCase):
       gaug, = res.metrics().query(beam.metrics.MetricsFilter()
                                   .with_name('gauge'))['gauges']
       self.assertEqual(gaug.committed.value, 3)
+
+    str_set, = res.metrics().query(beam.metrics.MetricsFilter()
+                                  .with_name('string_set'))['string_sets']
+    self.assertEqual(str_set.committed, set(elements))
+
+    if check_bounded_trie:
+      bounded_trie, = res.metrics().query(beam.metrics.MetricsFilter()
+                                    .with_name('bounded_trie'))['bounded_tries']
+      self.assertEqual(bounded_trie.committed.size(), 2)
+      for element in elements:
+        self.assertTrue(
+            bounded_trie.committed.contains(tuple(element)), element)
 
   def test_callbacks_with_exception(self):
     elements_list = ['1', '2']
@@ -2211,7 +2265,7 @@ class ElementCounter(object):
     return _unpickle_element_counter, (name, )
 
 
-_pickled_element_counters = {}  # type: Dict[str, ElementCounter]
+_pickled_element_counters: Dict[str, ElementCounter] = {}
 
 
 def _unpickle_element_counter(name):
@@ -2377,6 +2431,47 @@ class CustomMergingWindowFn(window.WindowFn):
 
   def get_window_coder(self):
     return coders.IntervalWindowCoder()
+
+
+class ColoredFixedWindow(window.BoundedWindow):
+  def __init__(self, end, color):
+    super().__init__(end)
+    self.color = color
+
+  def __hash__(self):
+    return hash((self.end, self.color))
+
+  def __eq__(self, other):
+    return (
+        type(self) == type(other) and self.end == other.end and
+        self.color == other.color)
+
+
+class ColoredFixedWindowCoder(beam.coders.Coder):
+  kv_coder = beam.coders.TupleCoder(
+      [beam.coders.TimestampCoder(), beam.coders.StrUtf8Coder()])
+
+  def encode(self, colored_window):
+    return self.kv_coder.encode((colored_window.end, colored_window.color))
+
+  def decode(self, encoded_window):
+    return ColoredFixedWindow(*self.kv_coder.decode(encoded_window))
+
+  def is_deterministic(self):
+    return True
+
+
+class EvenOddWindows(window.NonMergingWindowFn):
+  def assign(self, context):
+    timestamp = context.timestamp
+    return [
+        ColoredFixedWindow(
+            timestamp - timestamp % 10 + 10,
+            'red' if timestamp.micros // 1000000 % 2 else 'black')
+    ]
+
+  def get_window_coder(self):
+    return ColoredFixedWindowCoder()
 
 
 class ExpectingSideInputsFn(beam.DoFn):

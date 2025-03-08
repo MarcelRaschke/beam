@@ -15,9 +15,6 @@
 # limitations under the License.
 #
 
-# cython: language_level=3
-# cython: profile=True
-
 """Worker operations executor."""
 
 # pytype: skip-file
@@ -32,7 +29,6 @@ from typing import Any
 from typing import DefaultDict
 from typing import Dict
 from typing import FrozenSet
-from typing import Hashable
 from typing import Iterable
 from typing import Iterator
 from typing import List
@@ -207,14 +203,16 @@ class ConsumerSet(Receiver):
     # type: (WindowedValue) -> None
     self.opcounter.update_from(windowed_value)
 
+    if self.execution_context is not None:
+      self.execution_context.output_sampler = self.output_sampler
+
     # The following code is optimized by inlining a function call. Because this
     # is called for every element, a function call is too expensive (order of
     # 100s of nanoseconds). Furthermore, a lock was purposefully not used
     # between here and the DataSampler as an additional operation. The tradeoff
     # is that some samples might be dropped, but it is better than the
     # alternative which is double sampling the same element.
-    if self.element_sampler is not None and self.execution_context is not None:
-      self.execution_context.output_sampler = self.output_sampler
+    if self.element_sampler is not None:
       if not self.element_sampler.has_element:
         self.element_sampler.el = windowed_value
         self.element_sampler.has_element = True
@@ -1281,33 +1279,37 @@ class PGBKCVOperation(Operation):
       # pylint: disable=unidiomatic-typecheck
       # Optimization for the global window case.
       if self.is_default_windowing:
-        wkey = key  # type: Hashable
+        self.add_key_value(key, value, None)
       else:
-        wkey = tuple(wkv.windows), key
-      entry = self.table.get(wkey, None)
-      if entry is None:
-        if self.key_count >= self.max_keys:
-          target = self.key_count * 9 // 10
-          old_wkeys = []
-          # TODO(robertwb): Use an LRU cache?
-          for old_wkey, old_wvalue in self.table.items():
-            old_wkeys.append(old_wkey)  # Can't mutate while iterating.
-            self.output_key(old_wkey, old_wvalue[0], old_wvalue[1])
-            self.key_count -= 1
-            if self.key_count <= target:
-              break
-          for old_wkey in reversed(old_wkeys):
-            del self.table[old_wkey]
-        self.key_count += 1
-        # We save the accumulator as a one element list so we can efficiently
-        # mutate when new values are added without searching the cache again.
-        entry = self.table[wkey] = [self.combine_fn.create_accumulator(), None]
-        if not self.is_default_windowing:
-          # Conditional as the timestamp attribute is lazily initialized.
-          entry[1] = wkv.timestamp
-      entry[0] = self.combine_fn_add_input(entry[0], value)
-      if not self.is_default_windowing and self.timestamp_combiner:
-        entry[1] = self.timestamp_combiner.combine(entry[1], wkv.timestamp)
+        for window in wkv.windows:
+          self.add_key_value((window, key),
+                             value,
+                             wkv.timestamp if self.timestamp_combiner else None)
+
+  def add_key_value(self, wkey, value, timestamp):
+    entry = self.table.get(wkey, None)
+    if entry is None:
+      if self.key_count >= self.max_keys:
+        target = self.key_count * 9 // 10
+        old_wkeys = []
+        # TODO(robertwb): Use an LRU cache?
+        for old_wkey, old_wvalue in self.table.items():
+          old_wkeys.append(old_wkey)  # Can't mutate while iterating.
+          self.output_key(old_wkey, old_wvalue[0], old_wvalue[1])
+          self.key_count -= 1
+          if self.key_count <= target:
+            break
+        for old_wkey in reversed(old_wkeys):
+          del self.table[old_wkey]
+      self.key_count += 1
+      # We save the accumulator as a one element list so we can efficiently
+      # mutate when new values are added without searching the cache again.
+      entry = self.table[wkey] = [
+          self.combine_fn.create_accumulator(), timestamp
+      ]
+    entry[0] = self.combine_fn_add_input(entry[0], value)
+    if not self.is_default_windowing and self.timestamp_combiner:
+      entry[1] = self.timestamp_combiner.combine(entry[1], timestamp)
 
   def finish(self):
     # type: () -> None
@@ -1332,10 +1334,10 @@ class PGBKCVOperation(Operation):
     if self.is_default_windowing:
       self.output(_globally_windowed_value.with_value((wkey, value)))
     else:
-      windows, key = wkey
+      window, key = wkey
       if self.timestamp_combiner is None:
-        timestamp = windows[0].max_timestamp()
-      self.output(WindowedValue((key, value), timestamp, windows))
+        timestamp = window.max_timestamp()
+      self.output(WindowedValue((key, value), timestamp, (window, )))
 
 
 class FlattenOperation(Operation):
